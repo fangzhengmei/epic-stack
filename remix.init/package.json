@@ -1,0 +1,12 @@
+{
+  "name": "remix.init",
+  "private": true,
+  "main": "index.js",
+  "dependencies": {
+    "@iarna/toml": "^2.2.5",
+    "execa": "^9.6.1",
+    "inquirer": "^13.2.2",
+    "open": "^11.0.0",
+    "parse-github-url": "^1.0.3"
+  }
+}
