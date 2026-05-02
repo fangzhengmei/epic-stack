@@ -2,7 +2,7 @@
 
 ## 概述
 
-本文档深入分析 Epic Stack 中 Passkey（WebAuthn）登录的完整实现，包括注册流程和登录流程的安全生命周期，以及两者之间的关键差异。
+本文档深入分析 Epic Stack 中 Passkey（WebAuthn）登录的完整实现，包括注册流程和登录流程的安全生命周期、异常处理路径、以及两者之间的关键差异。
 
 ---
 
@@ -15,6 +15,7 @@
 | 数据验证 | `zod` |
 | 数据库 | SQLite + Prisma |
 | 会话管理 | React Router Cookie + Prisma Session |
+| Cookie 签名 | `cookie-signature` (HMAC-SHA256) |
 
 ---
 
@@ -31,7 +32,7 @@ model Passkey {
   publicKey      Bytes                  // 公钥 (用于验证签名)
   userId         String                 // 关联的用户 ID
   webauthnUserId String                // WebAuthn 用户句柄
-  counter        BigInt                 // 签名计数器 (防重放)
+  counter        BigInt                 // 签名计数器 (防重放/克隆)
   deviceType     String                 // 'singleDevice' 或 'multiDevice'
   backedUp       Boolean                // 是否已备份
   transports     String?                // 传输方式 (逗号分隔)
@@ -69,14 +70,55 @@ export const passkeyCookie = createCookie('webauthn-challenge', {
 })
 ```
 
-**安全设计要点：**
-- `httpOnly: true` - 防止 XSS 攻击读取 cookie
-- `sameSite: 'lax'` - 防止 CSRF 攻击
-- `secure` - 生产环境仅通过 HTTPS 传输
-- 签名加密 - 使用 `SESSION_SECRET` 签名，防止篡改
-- 有效期 2 小时 - 限制挑战的时间窗口
+### 2.2 Cookie 保护机制详解：签名 vs 加密
 
-### 2.2 WebAuthn 配置 (`utils.server.ts:81-89`)
+#### 关键概念区分
+
+| 特性 | 签名 (Signing) | 加密 (Encryption) |
+|------|----------------|-------------------|
+| **目的** | 保证数据完整性、防篡改 | 保证数据机密性 |
+| **数据可见性** | 数据仍然可读 (Base64 编码) | 数据不可读 (密文) |
+| **算法** | HMAC-SHA256 | AES 等对称加密算法 |
+| **可验证性** | 可以验证数据是否被篡改 | 需要解密才能验证 |
+| **当前实现** | ✅ 使用 `cookie-signature` | ❌ 未使用 |
+
+#### 当前实现的实际行为
+
+React Router 的 `createCookie` 配合 `secrets` 参数使用的是 **签名** 机制，而非加密：
+
+```
+原始数据: { challenge: "abc123", userId: "user_xyz" }
+    ↓
+序列化: JSON.stringify → Base64 编码
+    ↓
+签名: HMAC-SHA256(secret, data) → 生成签名
+    ↓
+最终 Cookie 值: <base64_data>.<signature>
+```
+
+**安全影响：**
+
+| 场景 | 保护效果 |
+|------|---------|
+| 攻击者读取 Cookie 内容 | ❌ **可读取** (Base64 可解码) |
+| 攻击者修改 Cookie 内容 | ✅ **可检测** (签名验证失败) |
+| 攻击者伪造 Cookie | ✅ **可防御** (无密钥无法生成有效签名) |
+
+**重要说明：** 对于 Passkey 的 challenge 来说，**签名已经足够安全**，因为：
+1. Challenge 本身是一次性随机值，泄露不影响安全性
+2. 更重要的是防止篡改，确保客户端使用的是服务端生成的 challenge
+
+#### 安全配置详解
+
+| 配置项 | 值 | 安全作用 |
+|--------|-----|----------|
+| `httpOnly: true` | 是 | 防止 XSS 攻击读取/修改 Cookie (JavaScript 无法访问) |
+| `sameSite: 'lax'` | 是 | 防止 CSRF 攻击：仅在第一方导航请求中发送 |
+| `secure` | 生产环境 `true` | 仅通过 HTTPS 传输，防止网络窃听 |
+| `secrets` | `SESSION_SECRET` | 用于 HMAC 签名，验证 Cookie 完整性和真实性 |
+| `maxAge: 2h` | 2 小时 | 限制 challenge 的有效时间窗口，缩小攻击面 |
+
+### 2.3 WebAuthn 配置 (`utils.server.ts:81-89`)
 
 ```typescript
 export function getWebAuthnConfig(request: Request) {
@@ -110,7 +152,7 @@ export function getWebAuthnConfig(request: Request) {
        │ 1. requireUserId() 验证用户登录状态
        │ 2. 查询用户已有 passkeys (用于排除)
        │ 3. generateRegistrationOptions() 生成选项
-       │ 4. 将 challenge + userId 存入加密 cookie
+       │ 4. 将 challenge + userId 存入签名 cookie
        └─────────────────────────────────────────────┐
                                                      │
 ┌──────────┐     返回 RegistrationOptions          │
@@ -283,7 +325,171 @@ export async function action({ request }: Route.ActionArgs) {
 }
 ```
 
-### 3.3 前端触发 (`passkeys.tsx:98-124`)
+### 3.3 注册流程的异常处理路径详解
+
+#### 异常分支总览
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    POST /webauthn/registration                  │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+              ┌───────────────┴───────────────┐
+              ▼                               ▼
+    ┌─────────────────┐              ┌─────────────────┐
+    │ requireUserId() │              │  Response 抛出   │
+    │   验证失败      │────────────▶│  (重定向到登录)  │
+    └─────────────────┘              └─────────────────┘
+              │
+      继续执行 (用户已登录)
+              │
+              ▼
+    ┌──────────────────────────────┐
+    │ RegistrationResponseSchema   │
+    │        safeParse             │
+    └──────────────────────────────┘
+              │
+      ┌───────┴───────┐
+      ▼               ▼
+  解析失败        解析成功
+      │               │
+      ▼               ▼
+"Invalid registration    继续
+   response"
+      │
+      ▼
+  HTTP 400
+  { status: 'error', error: '...' }
+  Cookie: 不清除
+```
+
+继续执行后的异常路径：
+
+```
+              │
+              ▼
+    ┌─────────────────────────┐
+    │ passkeyCookie.parse()   │
+    │ + PasskeyCookieSchema   │
+    └─────────────────────────┘
+              │
+      ┌───────┴───────┐
+      ▼               ▼
+  解析失败        解析成功
+      │               │
+      ▼               ▼
+"No challenge      继续
+    found"
+      │
+      ▼
+  HTTP 400
+  Cookie: 不清除
+```
+
+继续执行后的异常路径：
+
+```
+              │
+              ▼
+    ┌──────────────────────────────┐
+    │ verifyRegistrationResponse() │
+    │     (WebAuthn 核心验证)       │
+    └──────────────────────────────┘
+              │
+      ┌───────┴───────┐
+      ▼               ▼
+  verified=false   verified=true
+  或无 info          或有 info
+      │               │
+      ▼               ▼
+"Registration      继续
+ verification
+   failed"
+      │
+      ▼
+  HTTP 400
+  Cookie: 不清除
+```
+
+继续执行后的异常路径：
+
+```
+              │
+              ▼
+    ┌─────────────────────────┐
+    │ 检查 existingPasskey    │
+    │ (凭据是否已注册)         │
+    └─────────────────────────┘
+              │
+      ┌───────┴───────┐
+      ▼               ▼
+  已存在          不存在
+      │               │
+      ▼               ▼
+"This passkey      继续
+ has already
+been registered"
+      │
+      ▼
+  HTTP 400
+  Cookie: 不清除
+```
+
+继续执行后的异常路径：
+
+```
+              │
+              ▼
+    ┌─────────────────────────┐
+    │ prisma.passkey.create() │
+    │    (数据库写入)          │
+    └─────────────────────────┘
+              │
+      ┌───────┴───────┐
+      ▼               ▼
+  写入失败        写入成功
+  (如约束冲突等)        │
+      │               │
+      ▼               ▼
+  HTTP 400      ┌─────────────────┐
+  Cookie: 不清除 │   Cookie: 清除  │
+                │  return 成功    │
+                └─────────────────┘
+```
+
+#### 注册异常处理的安全设计分析
+
+| 异常场景 | 错误消息 | 安全影响 | 处理策略 |
+|---------|---------|---------|---------|
+| 用户未登录 | 重定向到 `/login` | 确保只有已认证用户可注册 | `requireUserId` 抛出 Response 重定向 |
+| 请求格式错误 | "Invalid registration response" | 防止注入/畸形请求 | Zod Schema 验证 |
+| Challenge 缺失/无效 | "No challenge found" | 防止无挑战注册 (防重放) | Cookie 解析 + Schema 验证 |
+| WebAuthn 验证失败 | "Registration verification failed" | 签名/Origin/RPID 验证失败 | 不暴露具体原因 (安全模糊) |
+| 凭据已注册 | "This passkey has already been registered" | 防止重复注册同一凭据 | 检查 `existingPasskey` |
+| 数据库写入失败 | 实际错误消息 | 如约束冲突等 | 透传 `getErrorMessage(error)` |
+
+**关键设计决策：注册流程失败时不清除 Cookie**
+
+```typescript
+// registration.ts:128-135
+} catch (error) {
+  if (error instanceof Response) throw error
+  
+  return Response.json(
+    { status: 'error', error: getErrorMessage(error) } as const,
+    { status: 400 },
+    // 注意：没有 Set-Cookie 清除 cookie！
+  )
+}
+```
+
+**为什么注册失败不清除 Cookie？**
+
+1. **用户可能重试** - 注册失败可能是临时问题（如用户取消指纹识别），保留 Cookie 允许用户重试
+2. **Challenge 仍然有效** - Challenge 有 2 小时有效期，失败后仍然可以使用
+3. **注册时用户已认证** - 通过 `requireUserId` 验证，风险较低
+
+### 3.4 前端触发 (`passkeys.tsx:98-124`)
 
 ```typescript
 async function handlePasskeyRegistration() {
@@ -333,7 +539,7 @@ async function handlePasskeyRegistration() {
        ┌─────────────────────────────────────────────┘
        │ 1. generateAuthenticationOptions() 生成选项
        │    - 无需用户信息 (可发现凭据)
-       │ 2. 将 challenge 存入加密 cookie
+       │ 2. 将 challenge 存入签名 cookie
        └─────────────────────────────────────────────┐
                                                      │
 ┌──────────┐     返回 AuthenticationOptions      │
@@ -389,12 +595,11 @@ export async function loader({ request }: Route.LoaderArgs) {
 }
 ```
 
-**与注册的关键差异：
+**与注册的关键差异：**
 
 | 差异点 | 注册 | 登录 |
 |--------|------|------|
 | 用户状态 | 必须已登录 (`requireUserId`) | 匿名用户 |
-| `allowCredentials` | 不适用 | 未指定 (可发现凭据) | 排除已有凭据 |
 | Cookie 内容 | challenge + userId | 仅 challenge |
 | 用户信息 | 需要 userName, userID, displayName | 无需提供 |
 
@@ -479,12 +684,276 @@ export async function action({ request }: Route.ActionArgs) {
       { headers: response.headers },
     )
   } catch (error) {
-    // ... 错误处理
+    if (error instanceof Response) throw error
+
+    return Response.json(
+      {
+        status: 'error',
+        error: error instanceof Error ? error.message : 'Verification failed',
+      } as const,
+      { status: 400, headers: { 'Set-Cookie': deletePasskeyCookie } },
+    )
   }
 }
 ```
 
-### 4.3 前端触发 (`login.tsx:238-277`)
+### 4.3 登录流程的异常处理路径详解
+
+#### 异常分支总览
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                   POST /webauthn/authentication                  │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+              ┌───────────────┴───────────────┐
+              ▼                               ▼
+    ┌─────────────────┐              ┌─────────────────┐
+    │  前置操作：      │              │  注意：登录时   │
+    │  预先准备好      │────────────▶│  **不需要**      │
+    │ deleteCookie    │              │  requireUserId  │
+    └─────────────────┘              └─────────────────┘
+              │
+              ▼
+    ┌──────────────────────────────┐
+    │ 检查 cookie?.challenge       │
+    │ (是否存在 challenge)          │
+    └──────────────────────────────┘
+              │
+      ┌───────┴───────┐
+      ▼               ▼
+  不存在          存在
+      │               │
+      ▼               ▼
+"Authentication     继续
+ challenge
+ not found"
+      │
+      ▼
+  HTTP 400
+  Cookie: 清除 (deletePasskeyCookie)
+```
+
+继续执行后的异常路径：
+
+```
+              │
+              ▼
+    ┌──────────────────────────────┐
+    │ PasskeyLoginBodySchema       │
+    │        safeParse              │
+    └──────────────────────────────┘
+              │
+      ┌───────┴───────┐
+      ▼               ▼
+  解析失败        解析成功
+      │               │
+      ▼               ▼
+"Invalid             继续
+authentication
+  response"
+      │
+      ▼
+  HTTP 400
+  Cookie: 清除
+```
+
+继续执行后的异常路径：
+
+```
+              │
+              ▼
+    ┌─────────────────────────┐
+    │ prisma.passkey.findUnique│
+    │ (根据 ID 查找凭据)       │
+    └─────────────────────────┘
+              │
+      ┌───────┴───────┐
+      ▼               ▼
+  不存在          存在
+      │               │
+      ▼               ▼
+"Passkey not       继续
+    found"
+      │
+      ▼
+  HTTP 400
+  Cookie: 清除
+```
+
+继续执行后的异常路径：
+
+```
+              │
+              ▼
+    ┌──────────────────────────────┐
+    │ verifyAuthenticationResponse()│
+    │     (WebAuthn 核心验证)       │
+    │  包含 counter 验证 (防克隆)    │
+    └──────────────────────────────┘
+              │
+      ┌───────┴───────┐
+      ▼               ▼
+  verified=false   verified=true
+      │               │
+      ▼               ▼
+"Authentication     继续
+ verification
+   failed"
+      │
+      ▼
+  HTTP 400
+  Cookie: 清除
+```
+
+继续执行后的异常路径：
+
+```
+              │
+              ▼
+    ┌─────────────────────────┐
+    │ prisma.passkey.update() │
+    │    (更新 counter)        │
+    └─────────────────────────┘
+              │
+      ┌───────┴───────┐
+      ▼               ▼
+  更新失败        更新成功
+      │               │
+      ▼               │
+  HTTP 400          继续
+  Cookie: 清除
+```
+
+继续执行后的异常路径：
+
+```
+              │
+              ▼
+    ┌─────────────────────────┐
+    │ prisma.session.create() │
+    │    (创建会话)            │
+    └─────────────────────────┘
+              │
+      ┌───────┴───────┐
+      ▼               ▼
+  创建失败        创建成功
+      │               │
+      ▼               │
+  HTTP 400    ┌─────────────────┐
+  Cookie: 清除 │   Cookie: 清除  │
+              │  return 成功    │
+              │  + 重定向地址   │
+              └─────────────────┘
+```
+
+#### 登录异常处理的安全设计分析
+
+| 异常场景 | 错误消息 | 安全影响 | 处理策略 |
+|---------|---------|---------|---------|
+| Challenge 缺失/无效 | "Authentication challenge not found" | 防止无挑战认证 (防重放) | **强制清除 Cookie** |
+| 请求格式错误 | "Invalid authentication response" | 防止注入/畸形请求 | **强制清除 Cookie** |
+| 凭据不存在 | "Passkey not found" | 防止枚举用户凭据 | **强制清除 Cookie** |
+| WebAuthn 验证失败 | "Authentication verification failed" | 签名/Counter/Origin 验证失败 | **强制清除 Cookie** |
+| Counter 更新失败 | 实际错误消息 | 数据库操作失败 | **强制清除 Cookie** |
+| 会话创建失败 | 实际错误消息 | 数据库操作失败 | **强制清除 Cookie** |
+
+**关键设计决策：登录流程无论成功失败都清除 Cookie**
+
+```typescript
+// authentication.ts:29-32
+const cookieHeader = request.headers.get('Cookie')
+const cookie = await passkeyCookie.parse(cookieHeader)
+const deletePasskeyCookie = await passkeyCookie.serialize('', { maxAge: 0 })
+// ↑ 预先准备好删除 cookie 的 header
+
+// authentication.ts:102-111
+} catch (error) {
+  if (error instanceof Response) throw error
+
+  return Response.json(
+    {
+      status: 'error',
+      error: error instanceof Error ? error.message : 'Verification failed',
+    } as const,
+    { status: 400, headers: { 'Set-Cookie': deletePasskeyCookie } },
+    // ↑ 无论什么错误，都强制清除 cookie
+  )
+}
+```
+
+**为什么登录失败必须清除 Cookie？**
+
+1. **防止重放攻击** - 匿名场景下风险更高，一次性使用后必须作废
+2. **防止凭据枚举** - 如果攻击者尝试不同的凭据 ID，每次失败都清除 challenge，增加攻击成本
+3. **登录时用户未认证** - 匿名用户场景，安全要求更严格
+4. **防止计数器攻击** - 如果验证失败但 counter 已递增，旧 challenge 可能失效
+
+### 4.4 Counter (签名计数器) 机制详解
+
+#### 为什么需要 Counter？
+
+Counter 是 WebAuthn 中用于防止 **认证器克隆攻击** 的核心机制。
+
+#### 工作原理
+
+```
+正常认证流程：
+┌──────────────────────────────────────────────────────────────────┐
+│  服务端存储 counter = 5                                       │
+│         ↓                                                      │
+│  认证器签名时使用 counter = 5                                   │
+│         ↓                                                      │
+│  认证器内部递增 counter → 6 (嵌入在 authenticatorData 中)     │
+│         ↓                                                      │
+│  服务端验证：newCounter (6) > storedCounter (5) ✅ 通过       │
+│         ↓                                                      │
+│  更新数据库 counter = 6                                       │
+└──────────────────────────────────────────────────────────────────┘
+
+克隆攻击检测：
+┌──────────────────────────────────────────────────────────────────┐
+│  攻击者克隆了认证器，counter = 5 (与服务端相同)                  │
+│         ↓                                                      │
+│  真实用户正常登录：counter 5 → 6，服务端更新为 6               │
+│         ↓                                                      │
+│  攻击者使用克隆认证器登录：                                      │
+│    - 克隆认证器的 counter 仍然是 5                              │
+│    - 服务端存储的 counter 已是 6                                │
+│         ↓                                                      │
+│  服务端验证：newCounter (5) <= storedCounter (6) ❌ 拒绝！     │
+│         ↓                                                      │
+│  检测到克隆攻击！阻止攻击者登录                                  │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+#### Counter 验证失败的异常场景
+
+`verifyAuthenticationResponse` 中的 counter 验证可能失败的情况：
+
+| 场景 | 原因 | 安全意义 |
+|------|------|---------|
+| `newCounter == 0 && storedCounter > 0` | 认证器不支持 counter，或重置 | 可能是克隆的认证器 |
+| `newCounter <= storedCounter` | counter 没有递增 | **强烈暗示克隆攻击** |
+| `newCounter - storedCounter > 合理阈值` | counter 跳跃过大 | 可能异常或攻击 |
+
+#### 代码中的 Counter 更新
+
+```typescript
+// authentication.ts:71-75
+// Update the authenticator's counter in the DB to the newest count
+await prisma.passkey.update({
+  where: { id: passkey.id },
+  data: { counter: BigInt(verification.authenticationInfo.newCounter) },
+})
+```
+
+**注意：**
+1. Counter 只在 **登录流程** 中更新
+2. 注册流程中存储的是认证器返回的初始 counter（通常为 0）
+3. 如果 Counter 更新失败，整个登录流程失败，Cookie 被清除
+
+### 4.5 前端触发 (`login.tsx:238-277`)
 
 ```typescript
 async function handlePasskeyLogin() {
@@ -538,19 +1007,105 @@ async function handlePasskeyLogin() {
 
 | 维度 | 注册流程 (Registration) | 登录流程 (Authentication) |
 |------|---------------------------|--------------------------|
-| **用户状态 | 必须已登录 (认证态) | 匿名用户 (未认证) |
-| **主要目标 | 创建并存储新凭据 | 验证现有凭据并建立会话 |
+| **用户状态** | 必须已登录 (认证态) | 匿名用户 (未认证) |
+| **主要目标** | 创建并存储新凭据 | 验证现有凭据并建立会话 |
 | **凭据来源** | 认证器新生成 | 从数据库查询 |
 | **Challenge 绑定** | challenge + userId | 仅 challenge |
 | **验证所需数据** | 无需预存数据 | 需要 publicKey + counter |
+| **Counter 机制** | 仅存储初始值 | 验证 + 更新 (防克隆) |
 | **WebAuthn API** | `generateRegistrationOptions` | `generateAuthenticationOptions` |
 | | `verifyRegistrationResponse` | `verifyAuthenticationResponse` |
 | **浏览器 API** | `navigator.credentials.create()` | `navigator.credentials.get()` |
-| **数据库操作** | INSERT Passkey 记录 | SELECT + UPDATE Passkey |
-| **会话创建** | 否 (已有会话 | 是 (创建新 Session) |
+| **数据库操作** | INSERT Passkey 记录 | SELECT + UPDATE Passkey + INSERT Session |
+| **会话创建** | 否 (已有会话) | 是 (创建新 Session) |
 | **用户识别方式** | 会话中的 userId | 凭据 ID 查询 |
 
-### 5.2 核心安全机制差异详解
+### 5.2 失败分支处理的关键差异
+
+这是注册和登录流程最显著的安全设计差异：
+
+#### 差异对比表
+
+| 处理策略 | 注册流程 | 登录流程 |
+|---------|---------|----------|
+| **失败时清除 Cookie** | ❌ 不清除 | ✅ **强制清除** |
+| **用户认证前置** | ✅ `requireUserId()` | ❌ 无前置认证 |
+| **异常后重试** | 允许 (保留 challenge) | 必须重新获取 challenge |
+| **安全严格程度** | 较低 (用户已认证) | 较高 (匿名用户) |
+
+#### 核心差异代码
+
+**注册流程 - 失败时不清除 Cookie：**
+```typescript
+// registration.ts:128-135
+} catch (error) {
+  if (error instanceof Response) throw error
+
+  return Response.json(
+    { status: 'error', error: getErrorMessage(error) } as const,
+    { status: 400 },
+    // 没有 Set-Cookie header！
+  )
+}
+```
+
+**登录流程 - 无论成功失败都清除 Cookie：**
+```typescript
+// authentication.ts:29-32
+const deletePasskeyCookie = await passkeyCookie.serialize('', { maxAge: 0 })
+// ↑ 预先准备好删除
+
+// authentication.ts:102-111
+} catch (error) {
+  return Response.json(
+    { status: 'error', error: ... },
+    { status: 400, headers: { 'Set-Cookie': deletePasskeyCookie } },
+    // ↑ 强制清除
+  )
+}
+```
+
+#### 设计原理分析
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    为什么设计差异？                                │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  【注册场景】                                                    │
+│  ┌─────────────────────────────────────────────────────────┐  │
+│  │  用户身份：已通过会话认证 ✅                              │  │
+│  │  风险评估：较低                                            │  │
+│  │  失败原因：可能是用户取消操作、临时网络问题                 │  │
+│  │  设计决策：保留 Cookie，允许用户重试                       │  │
+│  └─────────────────────────────────────────────────────────┘  │
+│                                                                 │
+│  【登录场景】                                                    │
+│  ┌─────────────────────────────────────────────────────────┐  │
+│  │  用户身份：匿名 ❌                                        │  │
+│  │  风险评估：较高                                            │  │
+│  │  失败原因：可能是攻击者尝试、凭据枚举、重放攻击             │  │
+│  │  设计决策：强制清除 Cookie，使当前 challenge 作废          │  │
+│  │           攻击者必须重新获取新 challenge，增加攻击成本      │  │
+│  └─────────────────────────────────────────────────────────┘  │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 5.3 异常类型与处理方式对比
+
+| 异常类型 | 注册流程处理 | 登录流程处理 |
+|---------|-------------|-------------|
+| **用户认证失败** | 重定向到登录页 | 不适用 (无需认证) |
+| **Challenge 缺失** | 错误响应，Cookie 保留 | 错误响应，**Cookie 清除** |
+| **Schema 验证失败** | 错误响应，Cookie 保留 | 错误响应，**Cookie 清除** |
+| **凭据不存在** | 不适用 (注册新凭据) | 错误响应，**Cookie 清除** |
+| **WebAuthn 验证失败** | 错误响应，Cookie 保留 | 错误响应，**Cookie 清除** |
+| **凭据已存在** | 错误响应，Cookie 保留 | 不适用 (登录用现有凭据) |
+| **Counter 验证失败** | 不适用 | 错误响应，**Cookie 清除** |
+| **数据库操作失败** | 错误响应，Cookie 保留 | 错误响应，**Cookie 清除** |
+
+### 5.4 核心安全机制差异详解
 
 #### 1. 用户上下文的识别机制
 
@@ -581,9 +1136,10 @@ Passkey 绑定到该 userId
 | 阶段 | 注册 | 登录 |
 |------|------|------|
 | 生成 | 绑定 `{ challenge, userId }` | `{ challenge }` |
-| 存储 | 加密 Cookie (httpOnly + signed) | 加密 Cookie (httpOnly + signed) |
+| 存储 | 签名 Cookie (httpOnly + signed) | 签名 Cookie (httpOnly + signed) |
 | 验证 | 匹配 challenge + 验证 userId 匹配 | 仅匹配 challenge |
-| 清除 | 验证成功后清除 | 验证成功后清除 |
+| 成功后 | 清除 Cookie | 清除 Cookie |
+| 失败后 | **保留 Cookie** | **强制清除 Cookie** |
 | 有效期 | 2 小时 | 2 小时 |
 
 #### 3. 验证逻辑的核心差异
@@ -592,12 +1148,12 @@ Passkey 绑定到该 userId
 - 验证 attestationObject (包含新凭据证明)
 - 验证 clientDataJSON
 - 提取并返回新凭据的公钥
-- **不需要**预先知道公钥 (正在创建凭据
+- **不需要**预先知道公钥 (正在创建凭据)
 
 **登录验证 (`verifyAuthenticationResponse`)：**
 - 验证 authenticatorData + signature
 - **需要**提供存储的公钥验证签名
-- **需要**提供 counter 防重放
+- **需要**提供 counter 防重放/克隆
 - 返回 newCounter 用于更新
 
 ```typescript
@@ -625,26 +1181,15 @@ const verification = await verifyAuthenticationResponse({
 })
 ```
 
-#### 4. Counter (签名计数器机制
+#### 4. Counter (签名计数器) 机制
 
 这是登录流程独有的安全机制：
 
-```
-每次认证：
-┌─────────────────────────────────────────────────────────┐
-│  服务端存储 counter = 5                              │
-│         ↓                                           │
-│  认证器签名时使用 counter = 5                        │
-│         ↓                                           │
-│  认证器递增 counter → 6 (在 authenticatorData 中   │
-│         ↓                                           │
-│  服务端验证：newCounter (6) > storedCounter (5)    │
-│         ↓                                           │
-│  更新数据库 counter = 6                            │
-└─────────────────────────────────────────────────────────┘
-```
-
-**安全目的：** 防止认证器被克隆。如果攻击者克隆了认证器，两次认证器的 counter 会落后于真实认证器，服务端会检测到并拒绝。
+| 特性 | 注册流程 | 登录流程 |
+|------|---------|----------|
+| **使用 Counter** | 仅存储初始值 | 验证 + 更新 |
+| **验证失败时** | 不适用 | 阻止登录 + 清除 Cookie |
+| **安全目的** | 无 | 防止认证器克隆攻击 |
 
 ---
 
@@ -654,13 +1199,14 @@ const verification = await verifyAuthenticationResponse({
 
 | 威胁 | 防护机制 | 实现位置 |
 |------|---------|----------|
-| **XSS 攻击 | httpOnly Cookie | `utils.server.ts:12` |
+| **XSS 攻击** | httpOnly Cookie (JS 无法访问) | `utils.server.ts:12` |
 | **CSRF 攻击** | sameSite: 'lax' + signed cookie | `utils.server.ts:11,15` |
+| **Cookie 篡改** | HMAC 签名验证 | `utils.server.ts:15` |
 | **重放攻击** | Challenge 一次性使用 + 绑定验证 | registration.ts, authentication.ts |
 | **中间人攻击** | origin + rpID 验证 | 服务端 verify*Response |
-| **凭据克隆** | Counter 递增验证 | authentication.ts:72-75 |
+| **凭据克隆** | Counter 递增验证 (仅登录) | authentication.ts:72-75 |
 | **网络窃听** | HTTPS 强制 (生产环境) | `secure: process.env.NODE_ENV === 'production'` |
-| **凭据篡改** | Cookie 签名加密 | `secrets: [process.env.SESSION_SECRET]` |
+| **凭据枚举** | 模糊错误消息 + 失败清除 Cookie | authentication.ts 异常处理 |
 
 ### 6.2 关键安全决策分析
 
@@ -673,7 +1219,7 @@ attestationType: 'none'
 **含义：** 不要求认证器提供制造商证明 (Attestation Statement)
 
 **权衡：**
-- ✅ 隐私保护：不收集不到认证器型号信息
+- ✅ 隐私保护：不收集认证器型号信息
 - ⚠️ 无法验证认证器的真实性
 - ✅ 适合大多数消费级应用
 
@@ -720,6 +1266,7 @@ userVerification: 'preferred'
 | 登录前端触发 | `app/routes/_auth/login.tsx` (PasskeyLogin 组件) |
 | 数据库模型 | `prisma/schema.prisma` (Passkey model) |
 | 通用认证工具 | `app/utils/auth.server.ts` |
+| 会话存储 | `app/utils/session.server.ts` |
 
 ---
 
@@ -732,7 +1279,7 @@ userVerification: 'preferred'
 | `generateRegistrationOptions` | 生成注册选项 |
 | `verifyRegistrationResponse` | 验证注册响应 |
 | `generateAuthenticationOptions` | 生成认证选项 |
-| `verifyAuthenticationResponse` | 验证认证响应 |
+| `verifyAuthenticationResponse` | 验证认证响应 (含 Counter 验证) |
 
 ### @simplewebauthn/browser
 
@@ -740,6 +1287,13 @@ userVerification: 'preferred'
 |------|---------------|------|
 | `startRegistration` | `navigator.credentials.create()` | 触发注册流程 |
 | `startAuthentication` | `navigator.credentials.get()` | 触发登录流程 |
+
+### cookie-signature
+
+| 功能 | 说明 |
+|------|------|
+| HMAC-SHA256 | Cookie 签名算法，用于验证完整性和真实性 |
+| 非加密 | 数据可通过 Base64 解码读取，但无法伪造签名 |
 
 ---
 
@@ -750,6 +1304,37 @@ Epic Stack 的 Passkey 实现遵循 WebAuthn 标准，通过 `@simplewebauthn` �
 ### 注册与登录的核心差异本质上是：
 
 1. **注册 = 创建信任**：用户已认证，创建新的信任锚点 (凭据)
-2. **登录 = 使用信任**：用户未认证，使用已有的信任锚点证明身份
+   - 安全要求较低（用户已认证）
+   - 失败后允许重试（保留 Cookie）
+   - 不涉及 Counter 验证
 
-这种设计完全符合 WebAuthn 规范，同时通过多层安全机制 (Cookie 安全、Counter 防重放、Origin 验证等) 确保了生产环境的安全性。
+2. **登录 = 使用信任**：用户未认证，使用已有的信任锚点证明身份
+   - 安全要求较高（匿名用户）
+   - **无论成功失败都强制清除 Cookie**（防重放/枚举）
+   - 涉及 Counter 验证（防克隆攻击）
+
+### 异常处理的安全设计哲学
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                                                                 │
+│   【匿名场景 = 高风险 = 严格策略】                               │
+│                                                                 │
+│   登录流程：用户匿名，每次交互都是重新建立信任的过程             │
+│   - 任何失败都可能是攻击信号                                    │
+│   - 强制作废当前 challenge，增加攻击成本                         │
+│   - 模糊错误消息，防止信息泄露                                    │
+│                                                                 │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│   【已认证场景 = 低风险 = 宽松策略】                             │
+│                                                                 │
+│   注册流程：用户已通过会话认证                                   │
+│   - 失败可能是用户操作或临时问题                                 │
+│   - 保留 challenge 允许重试                                      │
+│   - 更好的用户体验                                               │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+这种设计完全符合 WebAuthn 规范，同时通过多层安全机制（Cookie 签名、Counter 防克隆、Origin 验证、失败清除策略等）确保了生产环境的安全性。
