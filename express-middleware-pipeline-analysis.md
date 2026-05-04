@@ -415,6 +415,205 @@ else {
 | **HMR** | 支持 | 不支持 |
 | **错误处理** | 堆栈修复 (`ssrFixStacktrace`) | 标准错误处理 |
 
+---
+
+## 静态资源分流场景对照表（核心！）
+
+这是理解整个中间件管道的核心部分。以下表格详细列出了 **开发模式** 和 **生产模式** 下，各种静态资源请求的处理结果。
+
+### 关键概念说明
+
+| 术语 | 含义 |
+|------|------|
+| **提前返回** | 中间件直接发送响应，**不会**调用 `next()`，请求不会进入 React Router |
+| **进入 React Router** | 中间件调用 `next()`，请求继续传递给后续中间件，最终由 React Router 处理 |
+| **命中** | 文件存在于静态资源目录中 |
+| **未命中** | 文件不存在 |
+
+---
+
+### 开发模式（IS_DEV）静态资源分流表
+
+| 场景 | 请求路径示例 | 文件是否存在 | 处理中间件 | 是否提前返回 | 是否进入 React Router | HTTP 状态码 | 详细说明 |
+|------|-------------|-------------|-----------|-------------|----------------------|------------|---------|
+| **静态资源命中** | `/src/App.tsx` | 是 | Vite Dev Server 中间件 | ✅ 是 | ❌ 否 | 200 | Vite 按需编译并返回文件，支持 HMR |
+| **静态资源命中** | `/@vite/client` | 是 | Vite Dev Server 中间件 | ✅ 是 | ❌ 否 | 200 | Vite HMR 客户端脚本 |
+| **静态资源未命中** | `/about` | 否 | Vite Dev Server 中间件 | ❌ 否 | ✅ 是 | - (由后续处理) | Vite 调用 `next()`，请求继续到动态 SSR 加载 |
+| **静态资源未命中** | `/api/users` | 否 | Vite Dev Server 中间件 | ❌ 否 | ✅ 是 | - (由后续处理) | 调用 `next()`，继续到 React Router |
+
+#### 开发模式关键结论
+
+```
+开发模式下：
+├─ 静态资源命中时：
+│   └─ ✅ 提前返回（Vite 中间件直接返回文件）
+│   └─ ❌ 不会进入 React Router
+│
+└─ 静态资源未命中时：
+    └─ ❌ 不提前返回
+    └─ ✅ 全部进入 React Router（通过动态 SSR 加载）
+```
+
+---
+
+### 生产模式（!IS_DEV）静态资源分流表
+
+生产模式有两个 `express.static` 中间件，配置不同：
+
+| 中间件 | 路径前缀 | 配置 |
+|--------|---------|------|
+| 第一个 | `/assets/*` | `fallthrough: false` |
+| 第二个 | 所有其他路径 | `fallthrough: true`（默认） |
+
+#### 生产模式详细分流表
+
+| 场景 | 请求路径示例 | 文件是否存在 | 处理中间件 | `fallthrough` | 是否提前返回 | 是否进入 React Router | HTTP 状态码 | 详细说明 |
+|------|-------------|-------------|-----------|---------------|-------------|----------------------|------------|---------|
+| **/assets 命中** | `/assets/logo.abc123.js` | 是 | 第一个 `express.static` | `false` | ✅ 是 | ❌ 否 | 200 | 返回文件，设置 `Cache-Control: immutable, max-age=31536000`（1年） |
+| **/assets 未命中** | `/assets/not-exist.def456.js` | 否 | 第一个 `express.static` | `false` | ✅ 是 | ❌ 否 | 404 | **关键！** `fallthrough: false`，直接返回 404，**不继续** |
+| **其他静态资源命中** | `/favicon.ico` | 是 | 第二个 `express.static` | `true` | ✅ 是 | ❌ 否 | 200 | 返回文件，设置 `Cache-Control: max-age=3600`（1小时） |
+| **其他静态资源命中** | `/img/user.png` | 是 | 第二个 `express.static` | `true` | ✅ 是 | ❌ 否 | 200 | 返回图片文件 |
+| **其他静态资源未命中** | `/about` | 否 | 第二个 `express.static` | `true` | ❌ 否 | ✅ 是 | - (由 React Router) | **关键！** `fallthrough: true`，调用 `next()`，**继续到 React Router** |
+| **其他静态资源未命中** | `/api/users` | 否 | 第二个 `express.static` | `true` | ❌ 否 | ✅ 是 | - (由 React Router) | 调用 `next()`，继续到 React Router |
+
+#### 生产模式关键结论
+
+```
+生产模式下：
+├─ /assets/* 路径：
+│   ├─ 命中时：
+│   │   └─ ✅ 提前返回（返回文件，缓存 1 年）
+│   │   └─ ❌ 不会进入 React Router
+│   │
+│   └─ 未命中时：
+│       └─ ✅ 提前返回（直接返回 404）
+│       └─ ❌ 不会进入 React Router（因为 fallthrough: false）
+│
+└─ 其他路径：
+    ├─ 命中时：
+    │   └─ ✅ 提前返回（返回文件，缓存 1 小时）
+    │   └─ ❌ 不会进入 React Router
+    │
+    └─ 未命中时：
+        └─ ❌ 不提前返回
+        └─ ✅ 进入 React Router（因为 fallthrough: true）
+```
+
+---
+
+### 快速对照表：提前返回 vs 进入 React Router
+
+| 环境 | 路径类型 | 文件状态 | 提前返回？ | 进入 React Router？ |
+|------|---------|---------|-----------|-------------------|
+| **开发** | 任何路径 | 命中 | ✅ 是 | ❌ 否 |
+| **开发** | 任何路径 | 未命中 | ❌ 否 | ✅ 是 |
+| **生产** | `/assets/*` | 命中 | ✅ 是 | ❌ 否 |
+| **生产** | `/assets/*` | 未命中 | ✅ 是（404） | ❌ **否（关键！）** |
+| **生产** | 其他路径 | 命中 | ✅ 是 | ❌ 否 |
+| **生产** | 其他路径 | 未命中 | ❌ 否 | ✅ 是 |
+
+---
+
+### 实际示例场景
+
+#### 场景 1：请求 `/assets/logo.abc123.js`（生产环境）
+
+```
+请求路径：/assets/logo.abc123.js
+环境：生产
+文件存在：是
+
+处理流程：
+1. 第一个 express.static（/assets 路径）匹配到
+2. 文件存在，fallthrough: false
+3. ✅ 提前返回：200 + 文件内容 + Cache-Control: immutable, max-age=31536000
+4. ❌ 不会进入 React Router
+```
+
+#### 场景 2：请求 `/assets/not-exist.js`（生产环境）
+
+```
+请求路径：/assets/not-exist.js
+环境：生产
+文件存在：否
+
+处理流程：
+1. 第一个 express.static（/assets 路径）匹配到
+2. 文件不存在，fallthrough: false
+3. ✅ 提前返回：404 Not Found
+4. ❌ 不会进入 React Router（关键！）
+```
+
+#### 场景 3：请求 `/about`（生产环境）
+
+```
+请求路径：/about
+环境：生产
+文件存在：否（build/client 目录下没有 about 文件）
+
+处理流程：
+1. 第一个 express.static（/assets 路径）不匹配
+2. 第二个 express.static（所有其他路径）匹配到
+3. 文件不存在，fallthrough: true
+4. ❌ 不提前返回，调用 next()
+5. ✅ 进入 React Router，由路由系统处理 /about 页面
+```
+
+#### 场景 4：请求 `/about`（开发环境）
+
+```
+请求路径：/about
+环境：开发
+文件存在：否（Vite 找不到对应的静态文件）
+
+处理流程：
+1. Vite Dev Server 中间件处理
+2. 文件不存在
+3. Vite 调用 next()
+4. ✅ 进入动态 SSR 加载
+5. ✅ 进入 React Router，由路由系统处理 /about 页面
+```
+
+---
+
+### 为什么 `/assets/*` 配置 `fallthrough: false`？
+
+这是一个重要的设计决策：
+
+```typescript
+app.use(
+    '/assets',
+    express.static('build/client/assets', {
+        immutable: true,
+        maxAge: '1y',
+        fallthrough: false,  // 关键配置
+    }),
+)
+```
+
+**原因分析：**
+
+1. **带 hash 的文件名**：`/assets` 目录下的文件都是 React Router 构建产物，文件名包含内容哈希（如 `logo.abc123.js`）
+2. **不应由路由处理**：如果 `/assets/*` 路径的文件不存在，这通常意味着：
+   - 构建过程中出现问题
+   - 或者是恶意请求（尝试访问不存在的构建文件）
+3. **性能优化**：直接返回 404，避免不必要的 React Router 路由解析开销
+4. **安全考虑**：防止攻击者通过构造 `/assets/*` 路径来探测应用路由
+
+**对比：其他路径配置 `fallthrough: true`**
+
+```typescript
+app.use(express.static('build/client', { maxAge: '1h' }))
+// fallthrough: true（默认）
+```
+
+这是因为 `build/client` 目录下包含：
+- 不带 hash 的文件（如 `favicon.ico`、`robots.txt`）
+- 这些文件如果不存在，可能是动态路由（如 `/about`、`/users/123`）
+- 需要让 React Router 来决定如何处理
+
+---
+
 ## 请求传递给 React Router
 
 ### 实现位置
@@ -469,7 +668,7 @@ declare module 'react-router' {
 ```
 扩展了 React Router 的 `AppLoadContext` 类型，添加 `serverBuild` 属性的类型安全。
 
-## 完整流程图
+## 完整流程图（修正版）
 
 ```
 请求进入
@@ -478,13 +677,13 @@ declare module 'react-router' {
     ↓
 [2] HTTPS 重定向
     ├─ 是 GET 且 X-Forwarded-Proto === 'http'?
-    │   └─ 是 → 302 重定向到 HTTPS
+    │   └─ 是 → 302 重定向到 HTTPS → 结束响应
     │   └─ 否 → 继续
     ↓
-[3] URL 尾部斜杠处理
+[3] URL 尾部斜杠处理 (app.get(/.*/, ...))
     ├─ 是 GET 且路径以 '/' 结尾且不是 '/'?
-    │   └─ 是 → 302 重定向到无斜杠路径
-    │   └─ 否 → 继续
+    │   └─ 是 → 302 重定向到无斜杠路径 → 结束响应
+    │   └─ 否 → 调用 next() 继续
     ↓
 [4] 压缩 (compression())
     ↓
@@ -492,10 +691,10 @@ declare module 'react-router' {
     ↓
 [6] Helmet 安全头
     ↓
-[7] 图片资源 404 快速处理
-    ├─ 路径匹配 /img/* 或 /favicons/*?
-    │   └─ 是 → 返回 404 (静态资源缺失)
-    │   └─ 否 → 继续
+[7] 图片资源 404 快速处理 (app.get([/^\/img\/.*/, ...]))
+    ├─ 是 GET 且路径匹配 /img/* 或 /favicons/*?
+    │   └─ 是 → 返回 404 → 结束响应 ⚠️
+    │   └─ 否 → 不匹配，继续
     ↓
 [8] Morgan 请求日志
     ├─ 跳过条件: 状态码 200 且 URL 以 /resources/images 或 /resources/healthcheck 开头
@@ -508,42 +707,64 @@ declare module 'react-router' {
     ├─ 是 GET/HEAD 且路径包含 /verify?
     │   └─ 是 → strongest
     └─ 其他 → general (1000 req/min 生产)
-    ├─ 超限? → 返回 429 Too Many Requests
+    ├─ 超限? → 返回 429 Too Many Requests → 结束响应
     └─ 未超限 → 继续
     ↓
 [10] X-Robots-Tag (条件性)
     ├─ ALLOW_INDEXING === false?
-    │   └─ 是 → 设置 X-Robots-Tag: noindex, nofollow
-    │   └─ 否 → 无操作
+    │   └─ 是 → 设置 X-Robots-Tag: noindex, nofollow → 继续
+    │   └─ 否 → 无操作 → 继续
     ↓
 [11] DEV / PROD 分叉点
     │
-    ├────────────────────────────────┬───────────────────────────────┐
-    │                                │                               │
-    ▼                                ▼                               ▼
-[11a] 开发模式                    [11b] 生产模式                   │
-    │                                │                               │
-    ▼                                ▼                               │
-[11a-1] Vite Dev Server          [11b-1] 静态资源服务              │
-         中间件                          /assets (1年 immutable)     │
-         (HMR, 按需编译)               其他 (1小时)                  │
-    │                                │                               │
-    ▼                                ▼                               │
-[11a-2] 动态 SSR 加载             [11b-2] 预编译构建                │
-         viteDevServer.                 import('../build/server')   │
-         ssrLoadModule('./server/app.ts')                           │
-    │                                │                               │
-    └────────────────────────────────┴───────────────────────────────┘
-                                    │
-                                    ▼
-[12] React Router 处理 (createRequestHandler)
-    │
-    ├─ 解析路由
-    ├─ 执行 loaders
-    ├─ 执行 actions (如果是表单提交等)
-    ├─ 渲染组件 (SSR)
-    └─ 返回 HTML 响应
+    ├─────────────────────────────────────────────────────────────────┐
+    │                                                                   │
+    ▼                                                                   ▼
+[11a] 开发模式 (IS_DEV)                                        [11b] 生产模式 (!IS_DEV)
+    │                                                                   │
+    ▼                                                                   ▼
+[11a-1] Vite Dev Server 中间件                                 [11b-1] 静态资源服务
+    │                                                                   │
+    ├─ 文件存在? ──→ 是 ──→ 返回文件 (支持 HMR) → 结束响应 ❌       ├─ /assets/* 路径?
+    │                                                                   │       │
+    └─ 文件不存在? ──→ 是 ──→ 调用 next() 继续                        │       ├─ 文件存在? ──→ 是 ──→ 返回文件 (缓存 1 年) → 结束响应 ❌
+    │                                                                   │       │
+    ▼                                                                   │       └─ 文件不存在? ──→ 是 ──→ fallthrough: false → 返回 404 → 结束响应 ❌
+[11a-2] 动态 SSR 加载                                                  │
+         viteDevServer.ssrLoadModule('./server/app.ts')               └─ 其他路径?
+    │                                                                           │
+    ▼                                                                           ├─ 文件存在? ──→ 是 ──→ 返回文件 (缓存 1 小时) → 结束响应 ❌
+[12a] React Router 处理 (createRequestHandler)                                │
+    │                                                                           └─ 文件不存在? ──→ 是 ──→ fallthrough: true → 调用 next() 继续
+    ├─ 解析路由                                                                         │
+    ├─ 执行 loaders                                                                     ▼
+    ├─ 执行 actions (如果是表单提交等)                                      [11b-2] 预编译构建
+    ├─ 渲染组件 (SSR)                                                                   │
+    └─ 返回 HTML 响应                                                                   ▼
+                                                                              [12b] React Router 处理 (createRequestHandler)
+                                                                                    │
+                                                                                    ├─ 解析路由
+                                                                                    ├─ 执行 loaders
+                                                                                    ├─ 执行 actions (如果是表单提交等)
+                                                                                    ├─ 渲染组件 (SSR)
+                                                                                    └─ 返回 HTML 响应
 ```
+
+### 关键修正说明
+
+1. **第 7 步（图片资源 404 快速处理）**：
+   - ⚠️ 这段代码使用 `app.get()` 注册，在代码中的位置（第 67 行）早于静态资源中间件（第 168/183/193 行）
+   - 如果请求路径匹配 `/img/*` 或 `/favicons/*`，会直接返回 404 并结束响应
+   - **静态资源中间件永远不会被执行到**
+
+2. **静态资源命中时**：
+   - ❌ **不会继续到路由处理**
+   - `express.static`（生产）或 Vite 中间件（开发）直接返回文件并结束响应
+
+3. **静态资源未命中时**：
+   - **生产环境 `/assets/*`**：`fallthrough: false`，直接返回 404，❌ **不继续**
+   - **生产环境其他路径**：`fallthrough: true`，调用 `next()`，✅ **继续到 React Router**
+   - **开发环境所有路径**：Vite 中间件调用 `next()`，✅ **继续到动态 SSR 加载**
 
 ## 关键设计亮点
 
