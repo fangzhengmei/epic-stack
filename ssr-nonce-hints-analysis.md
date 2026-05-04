@@ -154,8 +154,77 @@ export function getTheme(request: Request): Theme | null {
 }
 ```
 
-- 从 `en_theme` cookie 读取用户显式设置的主题
-- 默认返回 `'light'`，如果值无效则返回 `null`
+#### 3.4.1 分支逻辑的关键差异
+
+这段代码有一个微妙但重要的分支差异，取决于请求是否包含 cookie header：
+
+| 场景 | cookieHeader | parsed 值 | 最终返回值 |
+|------|-------------|-----------|-----------|
+| **无 cookie header** | `null` | `'light'`（三元运算符 else 分支） | `'light'` |
+| **有 cookie header，但无 en_theme cookie** | 存在（非 null） | `undefined`（`cookie.parse()[cookieName]` 不存在） | `null` |
+| **有 en_theme cookie，值为 'light' 或 'dark'** | 存在 | `'light'` 或 `'dark'` | 对应值 |
+| **有 en_theme cookie，值无效（如 'auto'）** | 存在 | `'auto'` | `null` |
+
+**代码执行流程图**：
+
+```
+getTheme(request)
+       │
+       ▼
+cookieHeader = request.headers.get('cookie')
+       │
+       ├───────────────────┬─────────────────────┐
+       │                   │                     │
+       ▼                   ▼                     ▼
+   cookieHeader      cookieHeader          cookieHeader
+   === null          !== null，但          !== null，且
+                     无 en_theme           有 en_theme
+       │               cookie                cookie
+       │                   │                     │
+       ▼                   ▼                     ▼
+parsed = 'light'   parsed = undefined    parsed = cookie 值
+       │                   │                     │
+       └───────────────────┼─────────────────────┘
+                           │
+                           ▼
+              parsed === 'light' or 'dark' ?
+                           │
+              ┌────────────┴────────────┐
+              │                         │
+              ▼                         ▼
+           Yes → return parsed      No → return null
+```
+
+#### 3.4.2 与 useTheme 的组合逻辑
+
+在客户端 `useTheme` hook 中，这个返回值会与 hints 组合：
+
+```typescript
+// theme-switch.tsx:125-133
+export function useTheme() {
+  const hints = useHints()
+  const requestInfo = useRequestInfo()
+  const optimisticMode = useOptimisticThemeMode()
+  
+  if (optimisticMode) {
+    return optimisticMode === 'system' ? hints.theme : optimisticMode
+  }
+  return requestInfo.userPrefs.theme ?? hints.theme  // ← 这里使用 nullish coalescing
+}
+```
+
+**优先级分析**：
+
+| requestInfo.userPrefs.theme | hints.theme | 最终结果 | 说明 |
+|------------------------------|-------------|---------|------|
+| `'light'` | `'dark'` | `'light'` | 用户显式设置了 light，优先使用 |
+| `'dark'` | `'light'` | `'dark'` | 用户显式设置了 dark，优先使用 |
+| `null` | `'dark'` | `'dark'` | 无用户偏好，使用系统提示 |
+| `undefined` | `'light'` | `'light'` | 无用户偏好，使用系统提示 |
+
+**关键点**：`null ?? hints.theme` 会返回 `hints.theme`，因为 `??` 只有在左侧是 `null` 或 `undefined` 时才返回右侧。这意味着：
+- 当 `getTheme` 返回 `null` 时，使用系统主题提示
+- 当 `getTheme` 返回 `'light'` 或 `'dark'` 时，使用用户显式设置的值
 
 ### 3.5 ClientHintCheck 组件
 
@@ -174,6 +243,25 @@ export function getTheme(request: Request): Theme | null {
 ---
 
 ## 4. 客户端订阅偏好变化与重新校验
+
+### 4.0 主题与时区 Hints 处理机制对比
+
+在深入分析之前，首先明确主题和时区两种 hints 的核心差异：
+
+| 特性 | 主题 (theme/color-scheme) | 时区 (timeZone) |
+|------|---------------------------|-----------------|
+| 订阅函数 | ✅ 有 `subscribeToSchemeChange` | ❌ 无对应订阅函数 |
+| 变化检测方式 | 实时监听媒体查询变化 | 仅页面加载时检查 cookie |
+| 更新方式 | `revalidate()` 重新校验，无刷新 | 页面刷新/重载 |
+| 用户体验 | 平滑过渡，无闪烁 | 完整页面重载 |
+| 依赖的 `@epic-web/client-hints` 模块 | `color-scheme` (导出订阅函数) | `time-zone` (仅导出 hint 定义) |
+
+**@epic-web/client-hints 支持的订阅函数**：
+- `@epic-web/client-hints/color-scheme` → `subscribeToSchemeChange`
+- `@epic-web/client-hints/reduced-motion` → `subscribeToMotionChange`
+- `@epic-web/client-hints/time-zone` → **无订阅函数**
+
+---
 
 ### 4.1 系统主题变化订阅
 
@@ -293,131 +381,7 @@ export function useTheme() {
 2. **用户显式偏好**（从 cookie 读取的 `userPrefs.theme`）
 3. **客户端提示**（从系统获取的 `hints.theme`）
 
-### 4.4 主题 vs 时区：订阅机制的关键差异
-
-这是一个非常重要的差异：**主题有自动订阅，时区没有！**
-
-#### 4.4.1 @epic-web/client-hints 库的订阅能力
-
-| Hint 类型 | 模块 | 是否有订阅函数 | 底层机制 |
-|-----------|------|---------------|----------|
-| 主题（theme） | `@epic-web/client-hints/color-scheme` | ✅ 有 `subscribeToSchemeChange` | 监听 `prefers-color-scheme` 媒体查询的 `change` 事件 |
-| 减少动画（reducedMotion） | `@epic-web/client-hints/reduced-motion` | ✅ 有 `subscribeToMotionChange` | 监听 `prefers-reduced-motion` 媒体查询的 `change` 事件 |
-| 时区（timeZone） | `@epic-web/client-hints/time-zone` | ❌ **没有订阅函数** | 静态获取 `Intl.DateTimeFormat().resolvedOptions().timeZone` |
-
-#### 4.4.2 为什么时区没有自动订阅？
-
-**技术原因**：
-1. **时区变化没有浏览器级别的事件**：
-   - 主题变化有 `prefers-color-scheme` 媒体查询，支持 `addEventListener('change', ...)`
-   - 时区获取是通过 `Intl.DateTimeFormat().resolvedOptions().timeZone`，这是一个**静态属性**，没有对应的事件监听机制
-
-2. **时区 hint 的定义（来自库源码）**：
-   ```typescript
-   export const clientHint = {
-     cookieName: 'CH-time-zone',
-     getValueCode: 'Intl.DateTimeFormat().resolvedOptions().timeZone',
-     fallback: 'UTC',
-   }
-   ```
-   - 只有获取值的代码，没有订阅变化的代码
-
-**产品原因**：
-1. **时区变化相对罕见**：用户不会像切换主题那样频繁切换时区
-2. **时区变化通常伴随页面重载**：比如用户跨时区旅行时，通常会刷新页面或重新打开应用
-
-#### 4.4.3 时区变化的校验路径
-
-**场景 1：首次访问（无 cookie 或 cookie 不准确）**
-
-这由 `getClientHintCheckScript()` 生成的内联脚本处理：
-
-```typescript
-// ClientHintCheck 组件渲染的脚本
-<script
-  nonce={nonce}
-  dangerouslySetInnerHTML={{
-    __html: hintsUtils.getClientHintCheckScript(),
-  }}
-/>
-```
-
-**脚本的行为**：
-1. 检查 `CH-time-zone` cookie 是否存在且值正确
-2. 如果**不存在**：设置 cookie 并**刷新页面**
-3. 如果**值不准确**：更新 cookie 并**刷新页面**
-
-**效果**：首次访问时，用户会看到一次页面刷新，但之后服务端就能正确渲染时区了。
-
-**场景 2：会话中时区变化（用户跨时区旅行）**
-
-**当前实现的限制**：
-- ❌ 没有自动检测时区变化的机制
-- ❌ 没有 `revalidate()` 触发
-- ❌ 不会自动更新服务端渲染的时间显示
-
-**用户需要手动触发**：
-1. **刷新页面**：这是最简单的方式，会重新运行 root loader，`getHints(request)` 会从 cookie 读取新值
-2. **清除 cookie 后刷新**：如果 cookie 仍保留旧时区，需要清除后刷新让脚本重新检测
-
-**场景 3：客户端时间显示的替代方案**
-
-对于需要实时更新的时间显示，应用通常采用以下策略：
-
-1. **服务端渲染 + 客户端 hydration 修正**：
-   - 服务端使用 `getHints(request).timeZone` 渲染
-   - 客户端在 hydration 后使用本地时区重新格式化
-   - 注意：这可能导致 hydration mismatch，需要 `suppressHydrationWarning`
-
-2. **纯客户端渲染时间**：
-   - 关键时间组件只在客户端渲染
-   - 使用 `useEffect` 或 `useLayoutEffect` 在客户端获取本地时区
-
-3. **使用相对时间**：
-   - 显示 "2 hours ago" 而非具体时间
-   - 相对时间不依赖时区，避免了这个问题
-
-#### 4.4.4 如果需要监听时区变化，如何实现？
-
-如果业务场景需要检测时区变化（比如跨国协作应用），可以自己实现：
-
-```typescript
-// 自定义时区变化检测
-function useTimeZoneChange(onChange: (newTimeZone: string) => void) {
-  React.useEffect(() => {
-    let lastTimeZone = Intl.DateTimeFormat().resolvedOptions().timeZone
-    
-    // 定期检查时区变化（不是最佳方案，但浏览器没有原生事件）
-    const interval = setInterval(() => {
-      const currentTimeZone = Intl.DateTimeFormat().resolvedOptions().timeZone
-      if (currentTimeZone !== lastTimeZone) {
-        lastTimeZone = currentTimeZone
-        onChange(currentTimeZone)
-      }
-    }, 1000 * 60) // 每分钟检查一次
-    
-    return () => clearInterval(interval)
-  }, [onChange])
-}
-
-// 使用
-function MyComponent() {
-  const { revalidate } = useRevalidator()
-  
-  useTimeZoneChange((newTimeZone) => {
-    // 更新 cookie
-    document.cookie = `CH-time-zone=${newTimeZone};path=/;max-age=31536000`
-    // 触发重新校验
-    revalidate()
-  })
-  
-  // ...
-}
-```
-
-**注意**：这种轮询方式效率不高，实际应用中需要谨慎使用。
-
-### 4.5 主题数据流总结
+### 4.4 数据流总结
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
@@ -450,53 +414,164 @@ function MyComponent() {
 └───────────────────────────────────────────────────────────────────────┘
 ```
 
-### 4.6 时区数据流总结
+---
+
+### 4.5 时区 Hints 变化的处理机制
+
+与主题不同，时区 hints **没有实时订阅机制**，只能通过页面刷新来更新。
+
+#### 4.5.1 getClientHintCheckScript 的工作原理
+
+`ClientHintCheck` 组件注入的内联脚本是时区 hints 检测的核心：
+
+```typescript
+// client-hints.tsx:48-55
+return (
+  <script
+    nonce={nonce}
+    dangerouslySetInnerHTML={{
+      __html: hintsUtils.getClientHintCheckScript(),
+    }}
+  />
+)
+```
+
+**脚本执行逻辑**（根据 `@epic-web/client-hints` 源码）：
+
+```javascript
+// 伪代码展示 getClientHintCheckScript 生成的脚本逻辑
+(function() {
+  const hints = {
+    theme: window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light',
+    timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+  };
+  
+  const cookieValue = document.cookie;
+  let needsReload = false;
+  
+  for (const [key, hint] of Object.entries(hintsConfig)) {
+    const currentValue = hints[key];
+    const cookieName = hint.cookieName;
+    
+    // 检查 cookie 中是否有该 hint
+    const cookieMatch = document.cookie.match(new RegExp(`${cookieName}=([^;]+)`));
+    const storedValue = cookieMatch ? cookieMatch[1] : null;
+    
+    // 如果没有存储或值不匹配，设置 cookie 并标记需要刷新
+    if (!storedValue || storedValue !== currentValue) {
+      document.cookie = `${cookieName}=${currentValue}; path=/; max-age=31536000`;
+      needsReload = true;
+    }
+  }
+  
+  if (needsReload) {
+    window.location.reload();
+  }
+})();
+```
+
+#### 4.5.2 时区变化的触发场景
+
+时区变化**不会自动触发更新**，只能在以下时机检测：
+
+| 场景 | 时区变化是否会被检测 | 处理方式 |
+|------|---------------------|---------|
+| 首次访问 | ✅ 检测并设置 cookie | 页面刷新（如果之前无 cookie） |
+| 页面刷新/导航 | ✅ 检测 cookie 与当前值是否匹配 | 不匹配则刷新页面 |
+| 用户在系统中更改时区（页面已打开） | ❌ 不会实时检测 | 需手动刷新页面 |
+| 用户跨时区旅行后重新访问 | ✅ 下次页面加载时检测 | 检测到时区变化后刷新 |
+
+#### 4.5.3 时区 Hint 的定义
+
+时区 hint 的定义非常简单，没有订阅机制：
+
+```typescript
+// @epic-web/client-hints/time-zone 源码
+import { type ClientHint } from '@epic-web/client-hints'
+
+export const clientHint = {
+  cookieName: 'CH-time-zone',
+  getValueCode: 'Intl.DateTimeFormat().resolvedOptions().timeZone',
+  fallback: 'UTC',
+} as const satisfies ClientHint<string>
+```
+
+相比之下，主题 hint 支持订阅是因为它需要监听媒体查询变化：
+
+```typescript
+// @epic-web/client-hints/color-scheme 支持订阅的原因
+// 主题可以通过 window.matchMedia 监听变化
+const mq = window.matchMedia('(prefers-color-scheme: dark)')
+mq.addEventListener('change', callback)
+```
+
+**时区无法实时订阅的技术原因**：
+- JavaScript 没有原生 API 来监听时区变化事件
+- `Intl.DateTimeFormat().resolvedOptions().timeZone` 只能同步获取当前值
+- 没有类似 `matchMedia('(prefers-time-zone: ...)')` 的媒体查询
+
+#### 4.5.4 时区数据流
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
-│                         时区变化的两种场景                              │
+│                      时区 Hints 变化触发源                             │
 ├───────────────────────────────────────────────────────────────────────┤
 │                                                                       │
-│  ┌───────────────────────────────────────────────────────────────┐  │
-│  │ 场景 1: 首次访问 / Cookie 过期                                   │  │
-│  │                                                                 │  │
-│  │   getClientHintCheckScript() 生成的内联脚本                      │  │
-│  │              ↓                                                   │  │
-│  │   检查 CH-time-zone cookie 是否存在且正确                        │  │
-│  │              ↓                                                   │  │
-│  │   ┌───────────────┬───────────────┐                           │  │
-│  │   │ Cookie 不存在  │ Cookie 值错误  │                           │  │
-│  │   │ 或值已过期     │ 与实际时区不符 │                           │  │
-│  │   └───────┬───────┴───────┬───────┘                           │  │
-│  │           ↓                 ↓                                   │  │
-│  │      设置 Cookie         更新 Cookie                            │  │
-│  │           ↓                 ↓                                   │  │
-│  │      location.reload()  ←  刷新页面                             │  │
-│  │           ↓                                                     │  │
-│  │      重新请求，root loader 获取正确的 hints                      │  │
-│  └───────────────────────────────────────────────────────────────┘  │
+│   只有以下时机才会检测时区变化：                                        │
+│   ┌─────────────────────────────────────────────────────────────┐   │
+│   │  1. 首次访问页面                                                │   │
+│   │  2. 页面刷新 (F5 / window.location.reload())                  │   │
+│   │  3. 导航到新页面 (React Router 的导航不算，需要整页加载)        │   │
+│   └─────────────────────────────────────────────────────────────┘   │
 │                                                                       │
-│  ┌───────────────────────────────────────────────────────────────┐  │
-│  │ 场景 2: 会话中时区变化（如跨时区旅行）                            │  │
-│  │                                                                 │  │
-│  │   ⚠️ 当前实现：无自动检测机制                                    │  │
-│  │                                                                 │  │
-│  │   浏览器没有提供时区变化的事件（timeZone 不是媒体查询）            │  │
-│  │   @epic-web/client-hints/time-zone 没有 subscribe 函数          │  │
-│  │                                                                 │  │
-│  │   可能的触发方式：                                               │  │
-│  │   1. 用户手动刷新页面  ←  推荐方式                               │  │
-│  │   2. 应用自己实现轮询检测（如每分钟检查一次）                      │  │
-│  │   3. 清除 Cookie 后刷新，让脚本重新检测                          │  │
-│  │                                                                 │  │
-│  │   客户端时间显示的替代方案：                                      │  │
-│  │   • 使用相对时间（"2 hours ago"）                                │  │
-│  │   • 纯客户端渲染时间组件                                         │  │
-│  │   • hydration 后用本地时区重新格式化                             │  │
-│  └───────────────────────────────────────────────────────────────┘  │
+│                              ↓                                        │
+│                                                                       │
+│   ┌─────────────────────────────────────────────────────────────┐   │
+│   │  ClientHintCheck 内联脚本执行 (getClientHintCheckScript)     │   │
+│   │  ┌─────────────────────────────────────────────────────────┐ │   │
+│   │  │ 1. 读取当前时区: Intl.DateTimeFormat().resolvedOptions() │ │   │
+│   │  │ 2. 读取 cookie 中的 CH-time-zone 值                      │ │   │
+│   │  │ 3. 比较两者是否一致                                        │ │   │
+│   │  │ 4. 不一致 → 设置新 cookie + window.location.reload()     │ │   │
+│   │  │ 5. 一致 → 不做任何操作                                    │ │   │
+│   │  └─────────────────────────────────────────────────────────┘ │   │
+│   └─────────────────────────────────────────────────────────────┘   │
+│                                                                       │
+│                              ↓ (如果需要刷新)                          │
+│                                                                       │
+│   ┌─────────────────────────────────────────────────────────────┐   │
+│   │                     页面整页刷新                               │   │
+│   │  ┌─────────────────────────────────────────────────────────┐ │   │
+│   │  │ 1. 浏览器重新发起请求                                      │ │   │
+│   │  │ 2. 服务端收到请求，cookie 中已包含新的 CH-time-zone       │ │   │
+│   │  │ 3. root loader 执行，getHints(request) 读取新时区         │ │   │
+│   │  │ 4. 返回新的 requestInfo.hints.timeZone                    │ │   │
+│   │  │ 5. 页面渲染时使用正确的时区                                 │ │   │
+│   │  └─────────────────────────────────────────────────────────┘ │   │
+│   └─────────────────────────────────────────────────────────────┘   │
 │                                                                       │
 └───────────────────────────────────────────────────────────────────────┘
 ```
+
+---
+
+### 4.6 主题 vs 时区：完整对比总结
+
+| 维度 | 主题 (Theme) | 时区 (TimeZone) |
+|------|-------------|-----------------|
+| **实时订阅** | ✅ `subscribeToSchemeChange` 监听 `prefers-color-scheme` 媒体查询 | ❌ 无原生 API 可监听时区变化 |
+| **变化检测** | 实时检测，用户在系统设置中切换主题立即生效 | 仅页面加载时检测 |
+| **更新机制** | `useRevalidator().revalidate()` → 重新运行 loader，无页面刷新 | `window.location.reload()` → 整页刷新 |
+| **用户体验** | 平滑过渡，无闪烁，状态保持 | 页面重载，状态可能丢失（除非有恢复机制） |
+| **首次访问** | 检测后刷新（与时区相同） | 检测后刷新 |
+| **Cookie 名** | `CH-prefers-color-scheme` (hint) + `en_theme` (用户偏好) | `CH-time-zone` |
+| **服务端获取** | `getHints(request).theme` + `getTheme(request)` (用户偏好) | `getHints(request).timeZone` |
+| **常见使用场景** | UI 配色、深色/浅色模式切换 | 日期时间格式化、时间显示 |
+
+**设计决策原因**：
+1. **主题变化频繁**：用户可能频繁切换深色/浅色模式，需要平滑体验
+2. **时区变化罕见**：用户跨时区旅行是低频事件，整页刷新的影响较小
+3. **技术限制**：浏览器没有提供监听时区变化的原生 API，而主题变化可以通过 `matchMedia` 监听
 
 ---
 
