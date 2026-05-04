@@ -522,14 +522,847 @@ return Response.json({
 }
 ```
 
-### 2.4 安全设计要点
+### 2.4 Sessions 与 Roles 敏感信息边界分析
 
-| 安全措施 | 实现方式 | 文件位置 |
-|---------|---------|---------|
-| 密码排除 | `password: false` | download-user-data.tsx:36 |
-| 图片字段白名单 | `select: { id, createdAt, updatedAt, objectKey }` | download-user-data.tsx:17-22 |
-| 权限验证 | `requireUserId(request)` | download-user-data.tsx:7 |
-| URL 而非 Blob | `getUserImgSrc()` / `getNoteImgSrc()` | download-user-data.tsx:50, 57 |
+#### 当前导出配置
+
+```typescript
+// download-user-data.tsx
+include: {
+  sessions: true,  // 全字段导出
+  roles: true,     // 全字段导出（含 permissions）
+}
+```
+
+#### Schema 数据结构（来自 `prisma/schema.prisma`）
+
+**Session 模型**：
+```prisma
+model Session {
+  id             String   @id @default(cuid())
+  expirationDate DateTime
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+  userId         String
+}
+```
+
+**Role 模型**：
+```prisma
+model Role {
+  id          String       @id @default(cuid())
+  name        String       @unique
+  description String       @default("")
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+  permissions Permission[]
+}
+
+model Permission {
+  id          String @id @default(cuid())
+  action      String // create, read, update, delete
+  entity      String // note, user, etc.
+  access      String // own or any
+  description String @default("")
+}
+```
+
+---
+
+---
+
+### 2.4.1 Session 字段级风险深度评估
+
+#### 当前 Session 机制分析（来自 `auth.server.ts`）
+
+```typescript
+// 1. Cookie 存储：签名的 session 数据
+const authSessionStorage = createCookieSessionStorage({
+  cookie: {
+    name: 'en_session',
+    secrets: process.env.SESSION_SECRET.split(','),  // 签名密钥
+    httpOnly: true,
+    secure: process.env.NODE_ENV === 'production',
+  },
+})
+
+// 2. 验证流程：Cookie 中的 sessionId = 数据库 Session.id
+export const sessionKey = 'sessionId'
+
+export async function getUserId(request: Request) {
+  const authSession = await authSessionStorage.getSession(cookie)
+  const sessionId = authSession.get(sessionKey)  // 从 Cookie 中获取
+  const session = await prisma.session.findUnique({
+    where: { id: sessionId },  // 直接用 Session.id 查询
+  })
+}
+```
+
+**关键发现**：
+- `Session.id` = `sessionId` = Cookie 中存储的会话标识符
+- Cookie 是**签名的**（需要 `SESSION_SECRET` 才能伪造）
+- 但 `Session.id` 本身就是**验证的关键依据**
+
+---
+
+#### Session 各字段风险矩阵
+
+| 字段 | 敏感等级 | 直接风险 | 间接风险 | 泄露影响 |
+|------|---------|---------|---------|---------|
+| **id** | 🔴 **高** | 会话劫持（需配合其他漏洞） | 社会工程、账户侦察 | 可用于验证用户身份 |
+| **expirationDate** | 🟡 中 | 无直接攻击 | 知道会话有效时间窗口 | 攻击者可规划攻击时机 |
+| **createdAt** | 🟡 低 | 无 | 分析用户登录习惯 | 了解用户活跃时间 |
+| **updatedAt** | 🟡 低 | 无 | 分析会话刷新频率 | 了解用户使用模式 |
+| **userId** | 🟢 低 | 无（已导出） | 冗余信息 | 用户已知道自己的 ID |
+
+---
+
+#### Session.id 风险的真实场景分析
+
+**场景 1：配合 XSS 漏洞（高风险）**
+
+```
+前提：网站存在 XSS 漏洞
+
+攻击链：
+1. 攻击者通过 XSS 获取用户的 Cookie（en_session）
+2. 但 Cookie 是 HttpOnly 的，XSS 无法直接读取 ❌
+3. 攻击者通过其他方式（如社工）获取用户导出的数据
+4. 从导出数据中提取 sessionId 列表
+5. 结合 XSS，攻击者可以：
+   - 构造 AJAX 请求，使用目标用户的浏览器
+   - 但无法直接设置 HttpOnly Cookie
+
+结论：HttpOnly 提供了保护，但 sessionId 泄露仍是隐患
+```
+
+**场景 2：SESSION_SECRET 泄露（致命风险）**
+
+```
+前提：环境变量 SESSION_SECRET 泄露
+
+攻击链：
+1. 攻击者获取导出数据中的 sessionId 列表
+2. 攻击者使用泄露的 SESSION_SECRET 签名一个新的 Cookie
+3. Cookie 内容：{ sessionId: "泄露的ID" }
+4. 攻击者直接使用这个伪造的 Cookie 登录
+
+结论：如果 SESSION_SECRET 泄露，sessionId 可直接用于账户接管
+```
+
+**场景 3：社会工程 + 内部威胁（中风险）**
+
+```
+攻击场景：
+1. 客服/内部人员获取用户导出数据
+2. 看到用户有多个活跃 session
+3. 知道用户近期登录过（createdAt 较近）
+4. 针对性进行钓鱼攻击（"检测到异常登录"）
+
+结论：session 元数据可用于精准社会工程
+```
+
+---
+
+### 2.4.2 Roles/Permissions 字段级风险深度评估
+
+#### 数据结构分析
+
+```prisma
+model Role {
+  id          String       @id @default(cuid())
+  name        String       @unique     // 如 "admin", "user", "editor"
+  description String       @default("") // 如 "系统管理员，拥有所有权限"
+  permissions Permission[]
+}
+
+model Permission {
+  id     String @id @default(cuid())
+  action String // create, read, update, delete
+  entity String // note, user, etc.
+  access String // own, any
+}
+```
+
+---
+
+#### Roles 各字段风险矩阵
+
+| 字段 | 敏感等级 | 风险场景 | 业务价值 |
+|------|---------|---------|---------|
+| **id** | 🟢 低 | 内部 CUID，无直接风险 | 用户不需要知道 |
+| **name** | 🟡 中 | 暴露身份（如 "admin"） | ✅ 用户有权知道自己的角色 |
+| **description** | 🟡 中 | 可能包含敏感描述 | ⚠️ 需评估内容 |
+| **createdAt** | 🟢 低 | 无 | 用户不需要知道 |
+| **updatedAt** | 🟢 低 | 无 | 用户不需要知道 |
+| **permissions** | 🟡 中 | 暴露权限范围 | ⚠️ 需权衡 |
+
+---
+
+#### Permissions 各字段风险矩阵
+
+| 字段 | 敏感等级 | 风险说明 |
+|------|---------|---------|
+| **id** | 🟢 低 | 内部 CUID |
+| **action** | 🟡 低 | 如 "delete" 可用于推断功能 |
+| **entity** | 🟡 低 | 如 "user" 暴露可操作的实体类型 |
+| **access** | 🟡 中 | "any" 表示可操作他人数据，风险较高 |
+| **description** | 🟢 低 | 说明文字 |
+
+---
+
+#### 高风险组合分析
+
+**危险组合 1：admin + delete:user:any**
+
+```json
+{
+  "roles": [{
+    "name": "admin",
+    "permissions": [{
+      "action": "delete",
+      "entity": "user",
+      "access": "any"
+    }]
+  }]
+}
+```
+
+**泄露影响**：
+1. 攻击者知道这是管理员账户
+2. 知道可以删除任意用户
+3. 针对此账户的攻击意愿大幅提升
+4. 钓鱼邮件可精准编造（"您的管理员权限将被撤销"）
+
+**危险组合 2：多个角色 + 复杂权限**
+
+```json
+{
+  "roles": [
+    { "name": "content_editor", "permissions": [...] },
+    { "name": "user_manager", "permissions": [...] },
+    { "name": "report_viewer", "permissions": [...] }
+  ]
+}
+```
+
+**泄露影响**：
+1. 暴露用户在组织中的多重身份
+2. 可推断用户的职位和职责
+3. 用于商业情报或社会工程
+
+---
+
+### 2.4.3 禁止导出的场景分析
+
+#### 场景一：高权限用户导出
+
+| 用户角色 | 建议 | 理由 |
+|---------|------|------|
+| **admin / superuser** | ⚠️ 禁止导出 sessions | sessionId 泄露风险极高 |
+| **系统级权限用户** | ⚠️ 限制权限导出 | 权限信息可能暴露系统架构 |
+| **普通用户** | ✅ 可导出（需脱敏） | 风险相对较低 |
+
+**实现建议**：
+```typescript
+export async function loader({ request }: Route.LoaderArgs) {
+  const userId = await requireUserId(request)
+  const user = await prisma.user.findUnique({
+    where: { id: userId },
+    include: { roles: { include: { permissions: true } } },
+  })
+  
+  const isAdmin = user.roles.some(r => r.name === 'admin')
+  
+  const includeConfig = {
+    image: { select: { ... } },
+    notes: { ... },
+    password: false,
+    sessions: isAdmin ? false : true,  // 管理员禁止导出 sessions
+    roles: isAdmin 
+      ? { select: { name: true } }  // 管理员只导出角色名
+      : { select: { name: true, description: true, permissions: { ... } } },
+  }
+  
+  // ...
+}
+```
+
+---
+
+#### 场景二：业务敏感场景
+
+| 场景 | 建议 | 理由 |
+|------|------|------|
+| **金融/医疗系统** | ❌ 完全禁止导出 sessions | 合规要求（HIPAA, PCI-DSS） |
+| **企业内部系统** | ⚠️ 脱敏后导出 | 防止内部信息泄露 |
+| **社交/公开平台** | ⚠️ 谨慎导出 | 防止账户接管 |
+
+---
+
+#### 场景三：特殊状态用户
+
+| 用户状态 | 建议 | 理由 |
+|---------|------|------|
+| **已登录多设备** | ⚠️ 隐藏部分 session 信息 | 防止跨设备攻击 |
+| **近期密码修改** | ⚠️ 隐藏旧 session | 旧 session 可能已失效但仍有风险 |
+| **标记为高风险** | ❌ 禁止导出 | 额外保护 |
+
+---
+
+### 2.4.4 可落地的改造建议
+
+#### 方案 A：完全移除 Sessions + 最小化 Roles（推荐）
+
+**核心理念**：Session 是认证实现细节，不是用户数据；权限信息按需导出。
+
+**改造后的查询**：
+
+```typescript
+const user = await prisma.user.findUniqueOrThrow({
+  where: { id: userId },
+  include: {
+    image: {
+      select: { id: true, createdAt: true, updatedAt: true, objectKey: true },
+    },
+    notes: {
+      include: {
+        images: {
+          select: { id: true, createdAt: true, updatedAt: true, objectKey: true },
+        },
+      },
+    },
+    password: false,
+    // sessions: true,  // ❌ 完全移除 - 用户不需要知道
+    roles: {
+      select: {
+        name: true,
+        description: true,
+        // 只导出用户"能理解"的权限信息
+        permissions: {
+          select: {
+            action: true,
+            entity: true,
+            access: true,
+            description: true,
+          },
+        },
+        // 移除内部字段
+        // id: false,
+        // createdAt: false,
+        // updatedAt: false,
+      },
+    },
+  },
+})
+```
+
+**改造后的返回结构**：
+
+```json
+{
+  "user": {
+    "id": "cuid_xxx",
+    "email": "user@example.com",
+    "username": "johndoe",
+    "name": "John Doe",
+    "createdAt": "2024-01-01T00:00:00Z",
+    "updatedAt": "2024-01-01T00:00:00Z",
+    "image": { ... },
+    "notes": [ ... ],
+    "roles": [
+      {
+        "name": "editor",
+        "description": "内容编辑者",
+        "permissions": [
+          {
+            "action": "create",
+            "entity": "note",
+            "access": "own",
+            "description": "创建自己的笔记"
+          },
+          {
+            "action": "read",
+            "entity": "note",
+            "access": "any",
+            "description": "查看所有笔记"
+          }
+        ]
+      }
+    ]
+    // ❌ sessions 已移除
+    // ❌ roles[].id 已移除
+    // ❌ roles[].createdAt 已移除
+  }
+}
+```
+
+---
+
+#### 方案 B：如需保留 Sessions，强脱敏
+
+如果业务上确实需要让用户看到"有哪些设备登录"，使用以下方案：
+
+**改造步骤**：
+
+1. **数据库层面**：给 Session 表增加设备信息字段（如果没有）
+   ```prisma
+   model Session {
+     id             String   @id @default(cuid())
+     expirationDate DateTime
+     createdAt      DateTime @default(now())
+     
+     // 新增：用于显示的设备信息
+     userAgent      String?  // 浏览器/设备信息
+     ipAddress      String?  // IP 地址（可考虑哈希存储）
+     deviceName     String?  // 如 "iPhone 15", "Chrome on Windows"
+     
+     userId         String
+   }
+   ```
+
+2. **查询层面**：使用 select 白名单，排除敏感字段
+   ```typescript
+   sessions: {
+     select: {
+       // id: false,           // ❌ 绝对不能导出
+       expirationDate: true,    // ✅ 用户关心何时过期
+       createdAt: true,         // ✅ 用户关心何时登录
+       userAgent: true,         // ✅ 显示"什么设备"
+       deviceName: true,        // ✅ 友好的设备名称
+       // ipAddress: false,     // ⚠️ 敏感，考虑哈希后导出
+     },
+     orderBy: { createdAt: 'desc' },
+   }
+   ```
+
+3. **返回前进一步脱敏**：
+   ```typescript
+   return Response.json({
+     user: {
+       ...user,
+       sessions: user.sessions.map((session, index) => ({
+         ...session,
+         // 添加一个仅供显示的"会话编号"，不是真实 ID
+         displayId: `session_${index + 1}`,
+         // 模糊化时间，只显示日期
+         createdAt: session.createdAt.toISOString().split('T')[0],
+         expirationDate: session.expirationDate.toISOString().split('T')[0],
+       })),
+     },
+   })
+   ```
+
+**最终返回的 Session 结构**：
+```json
+{
+  "sessions": [
+    {
+      "displayId": "session_1",
+      "createdAt": "2024-01-15",
+      "expirationDate": "2024-02-14",
+      "userAgent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0)",
+      "deviceName": "iPhone 15 Pro"
+    },
+    {
+      "displayId": "session_2",
+      "createdAt": "2024-01-10",
+      "expirationDate": "2024-02-09",
+      "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+      "deviceName": "Chrome on Windows"
+    }
+  ]
+}
+```
+
+---
+
+#### 方案 C：权限信息的智能裁剪
+
+根据用户角色决定导出哪些权限信息：
+
+```typescript
+function getRoleSelectConfig(user: User) {
+  const isAdmin = user.roles.some(r => r.name === 'admin')
+  const isInternal = user.roles.some(r => 
+    ['employee', 'staff', 'moderator'].includes(r.name)
+  )
+  
+  if (isAdmin) {
+    // 管理员：只导出角色名，不导出详细权限
+    // 防止权限模型泄露
+    return {
+      select: {
+        name: true,
+        description: true,
+        // permissions: false,  // 不导出权限
+      },
+    }
+  }
+  
+  if (isInternal) {
+    // 内部用户：导出权限，但脱敏 access='any'
+    return {
+      select: {
+        name: true,
+        description: true,
+        permissions: {
+          select: {
+            action: true,
+            entity: true,
+            // access: false,  // 不导出 access 字段
+            description: true,
+          },
+        },
+      },
+    }
+  }
+  
+  // 普通用户：完整导出权限信息
+  return {
+    select: {
+      name: true,
+      description: true,
+      permissions: {
+        select: {
+          action: true,
+          entity: true,
+          access: true,
+          description: true,
+        },
+      },
+    },
+  }
+}
+```
+
+---
+
+#### 方案 D：增加导出确认和审计
+
+除了技术层面的脱敏，还应增加流程控制：
+
+```typescript
+export async function action({ request }: Route.ActionArgs) {
+  const userId = await requireUserId(request)
+  const formData = await request.formData()
+  const confirmation = formData.get('confirm-export')
+  
+  if (confirmation !== 'yes') {
+    return data({ error: '请确认数据导出' }, { status: 400 })
+  }
+  
+  // 记录导出日志
+  await prisma.auditLog.create({
+    data: {
+      userId,
+      action: 'DATA_EXPORT',
+      details: JSON.stringify({
+        timestamp: new Date().toISOString(),
+        ipAddress: request.headers.get('x-forwarded-for'),
+        userAgent: request.headers.get('user-agent'),
+      }),
+    },
+  })
+  
+  // 发送邮件通知
+  await sendExportNotificationEmail(user.email, {
+    timestamp: new Date(),
+    ipAddress: request.headers.get('x-forwarded-for'),
+  })
+  
+  // 执行导出...
+}
+```
+
+---
+
+### 2.4.5 改造优先级建议
+
+| 优先级 | 改造项 | 风险等级 | 改造成本 |
+|-------|-------|---------|---------|
+| 🔴 P0 | **移除 sessions 导出** | 高风险 | 1 行代码 |
+| 🟡 P1 | **Roles 使用 select 白名单** | 中风险 | 10 行代码 |
+| 🟡 P1 | **移除 roles[].permissions[].access='any' 详细信息** | 中风险 | 中等 |
+| 🟢 P2 | **增加导出确认流程** | 低风险 | 中等 |
+| 🟢 P2 | **增加导出审计日志** | 低风险 | 中等 |
+| 🟢 P3 | **根据角色动态调整导出内容** | 低风险 | 较高 |
+
+---
+
+### 2.4.6 当前实现 vs 建议实现对比
+
+#### 当前导出结构（有风险）
+
+```json
+{
+  "user": {
+    "sessions": [
+      {
+        "id": "cuid_session_123",        // ❌ 敏感：sessionId
+        "expirationDate": "2024-02-14T...",
+        "createdAt": "2024-01-15T...",
+        "updatedAt": "2024-01-16T...",
+        "userId": "cuid_user_456"
+      }
+    ],
+    "roles": [
+      {
+        "id": "cuid_role_789",           // ⚠️ 内部字段
+        "name": "admin",
+        "description": "系统管理员",
+        "createdAt": "2023-01-01T...",  // ⚠️ 内部字段
+        "updatedAt": "2023-06-01T...",  // ⚠️ 内部字段
+        "permissions": [
+          {
+            "id": "cuid_perm_abc",       // ⚠️ 内部字段
+            "action": "delete",
+            "entity": "user",
+            "access": "any",              // ⚠️ 高风险权限
+            "description": "删除任意用户",
+            "createdAt": "...",           // ⚠️ 内部字段
+            "updatedAt": "..."            // ⚠️ 内部字段
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+#### 建议导出结构（安全）
+
+```json
+{
+  "user": {
+    // sessions 字段已完全移除
+    "roles": [
+      {
+        "name": "admin",
+        "description": "系统管理员",
+        "permissions": [
+          {
+            "action": "delete",
+            "entity": "user",
+            // access 字段已移除或模糊化
+            "description": "删除任意用户"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+---
+
+#### 关键风险：Session.id 泄露（修正版）
+
+**当前实现的隐患**：
+
+```typescript
+sessions: true  // 导出所有 session 记录，包括 id
+```
+
+**真实攻击场景评估**：
+
+基于代码分析（`auth.server.ts:29-47`）：
+
+```typescript
+export async function getUserId(request: Request) {
+  const authSession = await authSessionStorage.getSession(
+    request.headers.get('cookie'),
+  )
+  const sessionId = authSession.get(sessionKey)  // 从签名 Cookie 中获取
+  if (!sessionId) return null
+  const session = await prisma.session.findUnique({
+    select: { userId: true },
+    where: { id: sessionId, expirationDate: { gt: new Date() } },
+  })
+  // ...
+}
+```
+
+**攻击链分析**：
+
+| 条件 | 能否攻击 | 说明 |
+|------|---------|------|
+| 仅获取 `Session.id` | ❌ 不能 | Cookie 是签名的，需要 `SESSION_SECRET` |
+| `Session.id` + `SESSION_SECRET` 泄露 | ✅ 能 | 可伪造有效 Cookie |
+| 配合 XSS 漏洞 | ⚠️ 受限 | Cookie 是 HttpOnly，XSS 无法读取 |
+| 配合 CSRF + 点击劫持 | ⚠️ 复杂 | 需要用户交互，成功率低 |
+
+**结论调整**：
+- `Session.id` 本身**不能直接**用于账户接管（因为 Cookie 是签名的）
+- 但 `Session.id` 是**高价值信息**，配合其他漏洞可造成严重后果
+- **仍强烈建议不导出**，符合数据最小化原则
+
+---
+
+#### 当前裁剪是否足够？
+
+| 评估项 | 结论 |
+|-------|------|
+| **password** | ✅ 已排除 (`password: false`) |
+| **Session.id** | ❌ **未保护，存在风险** |
+| **Roles/Permissions** | ⚠️ 部分风险，但通常可接受 |
+
+**理由**：
+1. **Session.id**：这是最敏感的字段，可能导致账户接管
+2. **Roles/Permissions**：暴露权限信息有风险，但用户"了解自己有什么权限"是合理的
+
+---
+
+#### 改进建议
+
+##### 建议一：完全排除 sessions（推荐）
+
+用户导出数据时，**不需要知道自己的 session 列表**。session 是认证机制的实现细节，不是用户数据。
+
+```typescript
+// 修改前
+include: {
+  sessions: true,  // ❌ 移除
+  roles: true,
+}
+
+// 修改后
+include: {
+  // sessions 完全不导出
+  roles: true,
+}
+```
+
+**理由**：
+- 用户无法"管理"自己的 sessions（除非系统提供此功能）
+- session 数据对用户无价值，仅对攻击者有价值
+- 符合数据最小化原则
+
+---
+
+##### 建议二：如需保留，至少脱敏 session.id
+
+如果业务上确实需要让用户知道"有哪些设备登录"，应脱敏处理：
+
+```typescript
+// 方案：使用 select 白名单，排除 id
+include: {
+  sessions: {
+    select: {
+      // id: false,  // 或者直接不包含
+      expirationDate: true,
+      createdAt: true,
+      // 可以添加设备信息字段（如果有）
+      // userAgent: true,
+      // ipAddress: true,
+    },
+  },
+}
+```
+
+**或者在返回前处理**：
+```typescript
+return Response.json({
+  user: {
+    ...user,
+    sessions: user.sessions.map(s => ({
+      ...s,
+      id: undefined,  // 移除 id
+      // 或者生成一个不敏感的显示 ID
+      displayId: s.id.slice(0, 8) + '...',
+    })),
+  },
+})
+```
+
+---
+
+##### 建议三：Roles/Permissions 评估
+
+对于 roles 和 permissions，需要权衡：
+
+| 考虑因素 | 分析 |
+|---------|------|
+| **用户知情权** | 用户应该知道自己有什么权限 |
+| **社会工程风险** | 攻击者知道"这是 admin"后更有针对性 |
+| **数据最小化** | 权限数据是否属于"用户个人数据"？ |
+
+**推荐方案**：保留，但谨慎处理
+
+```typescript
+include: {
+  roles: {
+    select: {
+      name: true,
+      description: true,
+      // createdAt/updatedAt 可保留或移除
+      permissions: {
+        select: {
+          action: true,
+          entity: true,
+          access: true,
+          // description 可保留
+        },
+      },
+    },
+  },
+}
+```
+
+**是否需要移除 `id` 字段？**
+- Role.id / Permission.id：通常是内部 CUID，泄露风险低
+- 但移除更符合"只导出用户需要的数据"原则
+
+---
+
+#### 最终建议配置
+
+```typescript
+const user = await prisma.user.findUniqueOrThrow({
+  where: { id: userId },
+  include: {
+    image: {
+      select: { id: true, createdAt: true, updatedAt: true, objectKey: true },
+    },
+    notes: {
+      include: {
+        images: {
+          select: { id: true, createdAt: true, updatedAt: true, objectKey: true },
+        },
+      },
+    },
+    password: false,
+    // sessions: true,  // ❌ 完全移除
+    roles: {
+      select: {
+        name: true,
+        description: true,
+        permissions: {
+          select: {
+            action: true,
+            entity: true,
+            access: true,
+            description: true,
+          },
+        },
+      },
+    },
+  },
+})
+```
+
+---
+
+### 2.5 安全设计要点（更新版）
+
+| 安全措施 | 实现方式 | 文件位置 | 状态 |
+|---------|---------|---------|------|
+| 密码排除 | `password: false` | download-user-data.tsx:36 | ✅ 已实现 |
+| 图片字段白名单 | `select: { id, createdAt, updatedAt, objectKey }` | download-user-data.tsx:17-22 | ✅ 已实现 |
+| 权限验证 | `requireUserId(request)` | download-user-data.tsx:7 | ✅ 已实现 |
+| URL 而非 Blob | `getUserImgSrc()` / `getNoteImgSrc()` | download-user-data.tsx:50, 57 | ✅ 已实现 |
+| **Session 排除** | 移除 `sessions: true` | - | ⚠️ **建议添加** |
+| **Roles 白名单** | 使用 select 替代 include | - | ⚠️ **建议优化** |
 
 ---
 
