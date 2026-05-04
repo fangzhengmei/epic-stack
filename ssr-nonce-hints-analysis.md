@@ -293,7 +293,131 @@ export function useTheme() {
 2. **用户显式偏好**（从 cookie 读取的 `userPrefs.theme`）
 3. **客户端提示**（从系统获取的 `hints.theme`）
 
-### 4.4 数据流总结
+### 4.4 主题 vs 时区：订阅机制的关键差异
+
+这是一个非常重要的差异：**主题有自动订阅，时区没有！**
+
+#### 4.4.1 @epic-web/client-hints 库的订阅能力
+
+| Hint 类型 | 模块 | 是否有订阅函数 | 底层机制 |
+|-----------|------|---------------|----------|
+| 主题（theme） | `@epic-web/client-hints/color-scheme` | ✅ 有 `subscribeToSchemeChange` | 监听 `prefers-color-scheme` 媒体查询的 `change` 事件 |
+| 减少动画（reducedMotion） | `@epic-web/client-hints/reduced-motion` | ✅ 有 `subscribeToMotionChange` | 监听 `prefers-reduced-motion` 媒体查询的 `change` 事件 |
+| 时区（timeZone） | `@epic-web/client-hints/time-zone` | ❌ **没有订阅函数** | 静态获取 `Intl.DateTimeFormat().resolvedOptions().timeZone` |
+
+#### 4.4.2 为什么时区没有自动订阅？
+
+**技术原因**：
+1. **时区变化没有浏览器级别的事件**：
+   - 主题变化有 `prefers-color-scheme` 媒体查询，支持 `addEventListener('change', ...)`
+   - 时区获取是通过 `Intl.DateTimeFormat().resolvedOptions().timeZone`，这是一个**静态属性**，没有对应的事件监听机制
+
+2. **时区 hint 的定义（来自库源码）**：
+   ```typescript
+   export const clientHint = {
+     cookieName: 'CH-time-zone',
+     getValueCode: 'Intl.DateTimeFormat().resolvedOptions().timeZone',
+     fallback: 'UTC',
+   }
+   ```
+   - 只有获取值的代码，没有订阅变化的代码
+
+**产品原因**：
+1. **时区变化相对罕见**：用户不会像切换主题那样频繁切换时区
+2. **时区变化通常伴随页面重载**：比如用户跨时区旅行时，通常会刷新页面或重新打开应用
+
+#### 4.4.3 时区变化的校验路径
+
+**场景 1：首次访问（无 cookie 或 cookie 不准确）**
+
+这由 `getClientHintCheckScript()` 生成的内联脚本处理：
+
+```typescript
+// ClientHintCheck 组件渲染的脚本
+<script
+  nonce={nonce}
+  dangerouslySetInnerHTML={{
+    __html: hintsUtils.getClientHintCheckScript(),
+  }}
+/>
+```
+
+**脚本的行为**：
+1. 检查 `CH-time-zone` cookie 是否存在且值正确
+2. 如果**不存在**：设置 cookie 并**刷新页面**
+3. 如果**值不准确**：更新 cookie 并**刷新页面**
+
+**效果**：首次访问时，用户会看到一次页面刷新，但之后服务端就能正确渲染时区了。
+
+**场景 2：会话中时区变化（用户跨时区旅行）**
+
+**当前实现的限制**：
+- ❌ 没有自动检测时区变化的机制
+- ❌ 没有 `revalidate()` 触发
+- ❌ 不会自动更新服务端渲染的时间显示
+
+**用户需要手动触发**：
+1. **刷新页面**：这是最简单的方式，会重新运行 root loader，`getHints(request)` 会从 cookie 读取新值
+2. **清除 cookie 后刷新**：如果 cookie 仍保留旧时区，需要清除后刷新让脚本重新检测
+
+**场景 3：客户端时间显示的替代方案**
+
+对于需要实时更新的时间显示，应用通常采用以下策略：
+
+1. **服务端渲染 + 客户端 hydration 修正**：
+   - 服务端使用 `getHints(request).timeZone` 渲染
+   - 客户端在 hydration 后使用本地时区重新格式化
+   - 注意：这可能导致 hydration mismatch，需要 `suppressHydrationWarning`
+
+2. **纯客户端渲染时间**：
+   - 关键时间组件只在客户端渲染
+   - 使用 `useEffect` 或 `useLayoutEffect` 在客户端获取本地时区
+
+3. **使用相对时间**：
+   - 显示 "2 hours ago" 而非具体时间
+   - 相对时间不依赖时区，避免了这个问题
+
+#### 4.4.4 如果需要监听时区变化，如何实现？
+
+如果业务场景需要检测时区变化（比如跨国协作应用），可以自己实现：
+
+```typescript
+// 自定义时区变化检测
+function useTimeZoneChange(onChange: (newTimeZone: string) => void) {
+  React.useEffect(() => {
+    let lastTimeZone = Intl.DateTimeFormat().resolvedOptions().timeZone
+    
+    // 定期检查时区变化（不是最佳方案，但浏览器没有原生事件）
+    const interval = setInterval(() => {
+      const currentTimeZone = Intl.DateTimeFormat().resolvedOptions().timeZone
+      if (currentTimeZone !== lastTimeZone) {
+        lastTimeZone = currentTimeZone
+        onChange(currentTimeZone)
+      }
+    }, 1000 * 60) // 每分钟检查一次
+    
+    return () => clearInterval(interval)
+  }, [onChange])
+}
+
+// 使用
+function MyComponent() {
+  const { revalidate } = useRevalidator()
+  
+  useTimeZoneChange((newTimeZone) => {
+    // 更新 cookie
+    document.cookie = `CH-time-zone=${newTimeZone};path=/;max-age=31536000`
+    // 触发重新校验
+    revalidate()
+  })
+  
+  // ...
+}
+```
+
+**注意**：这种轮询方式效率不高，实际应用中需要谨慎使用。
+
+### 4.5 主题数据流总结
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
@@ -323,6 +447,54 @@ export function useTheme() {
 │  │  Document 组件的 theme prop 更新，html className 变化           │   │
 │  │  <html lang="en" className={`${theme} h-full overflow-x-hidden`}>│
 │  └─────────────────────────────────────────────────────────────┘   │
+└───────────────────────────────────────────────────────────────────────┘
+```
+
+### 4.6 时区数据流总结
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                         时区变化的两种场景                              │
+├───────────────────────────────────────────────────────────────────────┤
+│                                                                       │
+│  ┌───────────────────────────────────────────────────────────────┐  │
+│  │ 场景 1: 首次访问 / Cookie 过期                                   │  │
+│  │                                                                 │  │
+│  │   getClientHintCheckScript() 生成的内联脚本                      │  │
+│  │              ↓                                                   │  │
+│  │   检查 CH-time-zone cookie 是否存在且正确                        │  │
+│  │              ↓                                                   │  │
+│  │   ┌───────────────┬───────────────┐                           │  │
+│  │   │ Cookie 不存在  │ Cookie 值错误  │                           │  │
+│  │   │ 或值已过期     │ 与实际时区不符 │                           │  │
+│  │   └───────┬───────┴───────┬───────┘                           │  │
+│  │           ↓                 ↓                                   │  │
+│  │      设置 Cookie         更新 Cookie                            │  │
+│  │           ↓                 ↓                                   │  │
+│  │      location.reload()  ←  刷新页面                             │  │
+│  │           ↓                                                     │  │
+│  │      重新请求，root loader 获取正确的 hints                      │  │
+│  └───────────────────────────────────────────────────────────────┘  │
+│                                                                       │
+│  ┌───────────────────────────────────────────────────────────────┐  │
+│  │ 场景 2: 会话中时区变化（如跨时区旅行）                            │  │
+│  │                                                                 │  │
+│  │   ⚠️ 当前实现：无自动检测机制                                    │  │
+│  │                                                                 │  │
+│  │   浏览器没有提供时区变化的事件（timeZone 不是媒体查询）            │  │
+│  │   @epic-web/client-hints/time-zone 没有 subscribe 函数          │  │
+│  │                                                                 │  │
+│  │   可能的触发方式：                                               │  │
+│  │   1. 用户手动刷新页面  ←  推荐方式                               │  │
+│  │   2. 应用自己实现轮询检测（如每分钟检查一次）                      │  │
+│  │   3. 清除 Cookie 后刷新，让脚本重新检测                          │  │
+│  │                                                                 │  │
+│  │   客户端时间显示的替代方案：                                      │  │
+│  │   • 使用相对时间（"2 hours ago"）                                │  │
+│  │   • 纯客户端渲染时间组件                                         │  │
+│  │   • hydration 后用本地时区重新格式化                             │  │
+│  └───────────────────────────────────────────────────────────────┘  │
+│                                                                       │
 └───────────────────────────────────────────────────────────────────────┘
 ```
 
