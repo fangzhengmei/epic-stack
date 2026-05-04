@@ -1157,6 +1157,531 @@ export function init() {
 
 ### 服务端 Sentry 配置
 
+#### 启动条件与初始化链路
+
+**触发点**: `server/index.ts:12-21`
+
+服务端 Sentry 监控的开启需要满足**两个必要条件**：
+
+```typescript
+// 第 12-16 行：环境变量和模式检查
+const MODE = process.env.NODE_ENV ?? 'development'
+const IS_PROD = MODE === 'production'
+const IS_DEV = MODE === 'development'
+// ...
+const SENTRY_ENABLED = IS_PROD && process.env.SENTRY_DSN
+```
+
+| 条件 | 要求 | 说明 |
+|------|------|------|
+| 环境模式 | `NODE_ENV === 'production'` | 开发环境禁用，避免噪音数据 |
+| DSN 配置 | `process.env.SENTRY_DSN` 存在且非空 | Sentry 项目的唯一标识符 |
+
+**初始化触发逻辑**:
+
+```typescript
+// 第 19-21 行：条件初始化
+if (SENTRY_ENABLED) {
+	void import('./utils/monitoring.ts').then(({ init }) => init())
+}
+```
+
+**设计要点**：
+1. **动态导入**：使用 `import()` 而非静态 `import`
+   - 只有在 `SENTRY_ENABLED === true` 时才加载 `monitoring.ts`
+   - 减小首屏 bundle 大小（虽然服务端不涉及 bundle，但符合一致性设计）
+   - 不使用 Sentry 时，相关代码完全不会执行
+
+2. **void 关键字**：`void import(...)` 显式忽略 Promise 返回值
+   - 表示"触发但不等待"异步操作
+   - Sentry 初始化不应该阻塞服务启动流程
+
+3. **全局导入**：`server/index.ts:3` 静态导入了 Sentry
+   ```typescript
+   import * as Sentry from '@sentry/react-router'
+   ```
+   - 这是为了在其他地方（如 `closeWithGrace`）直接使用 `Sentry.captureException`
+   - 但实际的 `Sentry.init()` 只有在 `SENTRY_ENABLED` 时才会调用
+
+---
+
+#### 完整初始化链路
+
+```
+┌──────────────────────────────────────────────────────────────────────────┐
+│                        服务端 Sentry 初始化链路                            │
+├──────────────────────────────────────────────────────────────────────────┤
+│                                                                           │
+│  服务启动 (node server/index.ts)                                          │
+│       │                                                                   │
+│       ▼                                                                   │
+│  ┌─────────────────────────────────────────────────────────────────┐    │
+│  │  server/index.ts:12-16                                          │    │
+│  │  ├── const MODE = process.env.NODE_ENV ?? 'development'        │    │
+│  │  ├── const IS_PROD = MODE === 'production'                      │    │
+│  │  └── const SENTRY_ENABLED = IS_PROD && process.env.SENTRY_DSN  │    │
+│  └─────────────────────────────────────────────────────────────────┘    │
+│       │                                                                   │
+│       ├── SENTRY_ENABLED === false ─────────────────► 跳过初始化        │
+│       │                                              (开发环境或无DSN)   │
+│       │                                                                   │
+│       ▼ (SENTRY_ENABLED === true)                                        │
+│  ┌─────────────────────────────────────────────────────────────────┐    │
+│  │  server/index.ts:19-21                                          │    │
+│  │  void import('./utils/monitoring.ts')                           │    │
+│  │    .then(({ init }) => init())                                   │    │
+│  └─────────────────────────────────────────────────────────────────┘    │
+│       │                                                                   │
+│       ▼                                                                   │
+│  ┌─────────────────────────────────────────────────────────────────┐    │
+│  │  server/utils/monitoring.ts:5-42                                │    │
+│  │  export function init() {                                        │    │
+│  │    Sentry.init({                                                 │    │
+│  │      dsn: process.env.SENTRY_DSN,                               │    │
+│  │      environment: process.env.NODE_ENV,                         │    │
+│  │      denyUrls: [...],                                            │    │
+│  │      integrations: [                                             │    │
+│  │        Sentry.prismaIntegration(...),                           │    │
+│  │        Sentry.httpIntegration(),                                 │    │
+│  │        nodeProfilingIntegration(),                               │    │
+│  │      ],                                                          │    │
+│  │      tracesSampler() { ... },                                    │    │
+│  │      beforeSendTransaction() { ... },                            │    │
+│  │    })                                                             │    │
+│  │  }                                                                │    │
+│  └─────────────────────────────────────────────────────────────────┘    │
+│       │                                                                   │
+│       ▼                                                                   │
+│  ✅ 服务端 Sentry 初始化完成                                              │
+│     ├── 自动捕获 HTTP 请求作为 Transaction                                │
+│     ├── 自动追踪 Prisma 查询作为 Span                                    │
+│     ├── 自动收集 Node.js 性能分析数据                                    │
+│     └── 准备好接收错误上报和性能数据                                      │
+│                                                                           │
+└──────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+#### 错误上报链路
+
+服务端错误上报有**三个主要入口**：
+
+##### 入口 1：React Router 全局错误处理
+
+**文件位置**: `app/entry.server.tsx:125-142`
+
+这是**最主要的错误捕获点**，捕获所有在 loader、action 或渲染过程中发生的错误：
+
+```typescript
+export function handleError(
+	error: unknown,
+	{ request }: LoaderFunctionArgs | ActionFunctionArgs,
+): void {
+	// 第 131-133 行：忽略请求中止的错误
+	// 用户关闭页面或取消请求时产生的错误，不需要追踪
+	if (request.signal.aborted) {
+		return
+	}
+
+	// 第 135-139 行：控制台错误输出（开发环境调试用）
+	if (error instanceof Error) {
+		console.error(styleText('red', String(error.stack)))
+	} else {
+		console.error(error)
+	}
+
+	// 第 141 行：关键！将错误发送到 Sentry
+	Sentry.captureException(error)
+}
+```
+
+**错误来源**：
+- `LoaderFunctionArgs`：loader 中抛出的错误
+- `ActionFunctionArgs`：action 中抛出的错误
+- React 组件渲染过程中抛出的错误
+
+**过滤逻辑**：
+- `request.signal.aborted`：请求被中止时不追踪
+- 这是因为用户主动取消操作（如关闭标签页）产生的错误是预期行为
+
+##### 入口 2：服务优雅关闭时的错误处理
+
+**文件位置**: `server/index.ts:236-248`
+
+使用 `close-with-grace` 库处理服务优雅关闭时的错误：
+
+```typescript
+closeWithGrace(async ({ err }) => {
+	// 第 237-239 行：关闭 HTTP 服务器
+	await new Promise((resolve, reject) => {
+		server.close((e) => (e ? reject(e) : resolve('ok')))
+	})
+
+	// 第 240-247 行：处理关闭过程中的错误
+	if (err) {
+		// 控制台输出
+		console.error(styleText('red', String(err)))
+		console.error(styleText('red', String(err.stack)))
+
+		// 第 243-246 行：发送到 Sentry
+		if (SENTRY_ENABLED) {
+			Sentry.captureException(err)
+			await Sentry.flush(500)  // 等待最多 500ms 确保事件发送
+		}
+	}
+})
+```
+
+**特殊处理**：
+- `Sentry.flush(500)`：确保在进程退出前将事件发送到 Sentry
+- 正常情况下，Sentry 会异步发送事件，但进程即将退出时需要显式等待
+- `500ms` 是超时时间，超过则放弃
+
+##### 入口 3：前端 Error Boundary 错误捕获
+
+**文件位置**: `app/components/error-boundary.tsx:37-41`
+
+这是**客户端**的错误捕获，但错误会上报到同一个 Sentry 项目：
+
+```typescript
+useEffect(() => {
+	// 第 38 行：如果是路由错误响应（如 404），则不上报
+	if (isResponse) return
+
+	// 第 40 行：捕获异常并发送到 Sentry
+	captureException(error)
+}, [error, isResponse])
+```
+
+**过滤逻辑**：
+- `isResponse`：`isRouteErrorResponse(error)` 的返回值
+- 路由错误响应（如 404、401 等）不上报
+- 只有真正的异常（`Error` 对象）才会上报
+
+---
+
+#### 错误上报完整流程图
+
+```
+┌──────────────────────────────────────────────────────────────────────────┐
+│                        服务端错误上报链路                                  │
+├──────────────────────────────────────────────────────────────────────────┤
+│                                                                           │
+│  ┌────────────────────────────────────────────────────────────────────┐ │
+│  │                    错误发生场景                                      │ │
+│  ├────────────────────────────────────────────────────────────────────┤ │
+│  │                                                                    │ │
+│  │  场景 A: Loader/Action 错误                                        │ │
+│  │  ┌─────────────┐    ┌─────────────┐    ┌─────────────────────┐  │ │
+│  │  │ loader 抛出 │───►│ action 抛出 │───►│ 组件渲染过程中抛出  │  │ │
+│  │  │   错误      │    │   错误      │    │      错误           │  │ │
+│  │  └─────────────┘    └─────────────┘    └─────────────────────┘  │ │
+│  │                              │                                       │ │
+│  │                              ▼                                       │ │
+│  │  ┌──────────────────────────────────────────────────────────────┐  │ │
+│  │  │  entry.server.tsx: handleError()                             │  │ │
+│  │  │  ├── 检查 request.signal.aborted                              │  │ │
+│  │  │  │   ├── true  ──► return (忽略请求中止错误)                  │  │ │
+│  │  │  │   └── false ──► 继续                                      │  │ │
+│  │  │  ├── 控制台输出错误栈                                          │  │ │
+│  │  │  └── Sentry.captureException(error)                          │  │ │
+│  │  └──────────────────────────────────────────────────────────────┘  │ │
+│  │                                                                    │ │
+│  └────────────────────────────────────────────────────────────────────┘ │
+│                                                                           │
+│  ┌────────────────────────────────────────────────────────────────────┐ │
+│  │                    场景 B: 服务关闭错误                              │ │
+│  ├────────────────────────────────────────────────────────────────────┤ │
+│  │                                                                    │ │
+│  │  服务收到 SIGTERM/SIGINT 信号                                      │ │
+│  │           │                                                        │ │
+│  │           ▼                                                        │ │
+│  │  server/index.ts: closeWithGrace()                                │ │
+│  │  ├── 关闭 HTTP 服务器                                              │ │
+│  │  ├── 检查是否有错误 (err)                                          │ │
+│  │  │   └── 有错误时：                                                │ │
+│  │  │       ├── 控制台输出错误                                        │ │
+│  │  │       ├── 检查 SENTRY_ENABLED                                  │ │
+│  │  │       │   └── true 时：                                        │ │
+│  │  │       │       ├── Sentry.captureException(err)                │ │
+│  │  │       │       └── await Sentry.flush(500)  ◄── 确保发送完成  │ │
+│  │  │       └── 进程退出                                              │ │
+│  └────────────────────────────────────────────────────────────────────┘ │
+│                                                                           │
+│  ┌────────────────────────────────────────────────────────────────────┐ │
+│  │                    场景 C: 前端 Error Boundary                      │ │
+│  ├────────────────────────────────────────────────────────────────────┤ │
+│  │                                                                    │ │
+│  │  客户端 React 组件渲染错误                                          │ │
+│  │           │                                                        │ │
+│  │           ▼                                                        │ │
+│  │  error-boundary.tsx: GeneralErrorBoundary                         │ │
+│  │  ├── useRouteError() 获取错误                                     │ │
+│  │  ├── isRouteErrorResponse(error) 检查                             │ │
+│  │  │   ├── true  ──► return (忽略 404 等路由错误)                  │ │
+│  │  │   └── false ──► 继续                                          │ │
+│  │  ├── useEffect(() => {                                            │ │
+│  │  │       captureException(error)  ◄── 发送到 Sentry              │ │
+│  │  │   }, [error, isResponse])                                      │ │
+│  │  └── 渲染错误 UI 给用户                                            │ │
+│  └────────────────────────────────────────────────────────────────────┘ │
+│                                                                           │
+│  ┌────────────────────────────────────────────────────────────────────┐ │
+│  │                    Sentry 内部处理流程                              │ │
+│  ├────────────────────────────────────────────────────────────────────┤ │
+│  │                                                                    │ │
+│  │  Sentry.captureException(error)                                   │ │
+│  │           │                                                        │ │
+│  │           ▼                                                        │ │
+│  │  1. 收集错误上下文                                                 │ │
+│  │     ├── 错误栈 (Stack Trace)                                      │ │
+│  │     ├── 当前 Transaction（如果有）                                 │ │
+│  │     ├── Breadcrumbs（之前的事件）                                  │ │
+│  │     └── 环境信息（浏览器/Node.js 版本等）                          │ │
+│  │                                                                    │ │
+│  │  2. 应用 beforeSend 钩子（如果配置）                               │ │
+│  │     └── 可以在这里修改或丢弃事件                                   │ │
+│  │                                                                    │ │
+│  │  3. 异步发送到 Sentry 服务器                                       │ │
+│  │     └── 使用 DSN 中配置的 Ingest URL                              │ │
+│  │                                                                    │ │
+│  │  4. Sentry 服务端处理                                             │ │
+│  │     ├── 解析错误栈                                                │ │
+│  │     ├── 符号化（Source Map）                                      │ │
+│  │     ├── 分组（Grouping）                                          │ │
+│  │     └── 触发告警（Alerting）                                      │ │
+│  └────────────────────────────────────────────────────────────────────┘ │
+│                                                                           │
+└──────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+#### 性能采样链路
+
+性能采样控制哪些请求的性能数据会被发送到 Sentry。
+
+##### 采样策略配置
+
+**文件位置**: `server/utils/monitoring.ts:26-41`
+
+```typescript
+// 第 26-31 行：事务采样器 - 决定是否采样
+tracesSampler(samplingContext) {
+	// 忽略健康检查请求
+	if (samplingContext.request?.url?.includes('/resources/healthcheck')) {
+		return 0
+	}
+	// 生产环境 100% 采样，开发环境 0%
+	return process.env.NODE_ENV === 'production' ? 1 : 0
+},
+
+// 第 33-41 行：事务发送前钩子 - 二次过滤
+beforeSendTransaction(event) {
+	// 忽略所有健康检查相关的事务
+	// 注意：header 名称是区分大小写的
+	if (event.request?.headers?.['x-healthcheck'] === 'true') {
+		return null
+	}
+
+	return event
+}
+```
+
+##### 采样决策流程
+
+```
+┌──────────────────────────────────────────────────────────────────────────┐
+│                        性能采样决策流程                                    │
+├──────────────────────────────────────────────────────────────────────────┤
+│                                                                           │
+│  HTTP 请求到达服务端                                                       │
+│           │                                                                │
+│           ▼                                                                │
+│  ┌──────────────────────────────────────────────────────────────────┐   │
+│  │  Sentry React Router 集成自动创建 Transaction                     │   │
+│  │  ├── 名称：HTTP 方法 + 路由模式（如 GET /users/:id）              │   │
+│  │  ├── 开始时间：请求到达时                                          │   │
+│  │  └── 上下文：请求信息（URL、headers、method 等）                   │   │
+│  └──────────────────────────────────────────────────────────────────┘   │
+│           │                                                                │
+│           ▼                                                                │
+│  ┌──────────────────────────────────────────────────────────────────┐   │
+│  │  第 1 层过滤：tracesSampler()                                      │   │
+│  │  ┌────────────────────────────────────────────────────────────┐  │   │
+│  │  │  samplingContext.request?.url                                │  │   │
+│  │  │  .includes('/resources/healthcheck')                         │  │   │
+│  │  │         │                                                     │  │   │
+│  │  │         ├── true  ──► return 0  ──► 不采样，丢弃 Transaction │  │   │
+│  │  │         │                                                     │  │   │
+│  │  │         └── false ──► 继续检查环境                           │  │   │
+│  │  │                   │                                           │  │   │
+│  │  │                   ├── NODE_ENV === 'production'              │  │   │
+│  │  │                   │       ├── true  ──► return 1  ◄── 100%  │  │   │
+│  │  │                   │       │                     采样          │  │   │
+│  │  │                   │       │                                   │  │   │
+│  │  │                   │       └── false ──► return 0  ◄── 开发  │  │   │
+│  │  │                   │                           环境不采样      │  │   │
+│  │  └────────────────────────────────────────────────────────────┘  │   │
+│  └──────────────────────────────────────────────────────────────────┘   │
+│           │                                                                │
+│           ├── tracesSampler 返回 0 ──────────► 流程结束，不采样         │
+│           │                                                                │
+│           ▼ (tracesSampler 返回 1)                                        │
+│  ┌──────────────────────────────────────────────────────────────────┐   │
+│  │  Transaction 被收集，等待发送                                      │   │
+│  │  ├── 自动添加的 Span：                                             │   │
+│  │  │   ├── Prisma 查询（通过 prismaIntegration）                     │   │
+│  │  │   ├── HTTP 出站请求（通过 httpIntegration）                     │   │
+│  │  │   └── 其他集成的追踪数据                                        │   │
+│  │  └── 等待请求完成（response 发送）                                  │   │
+│  └──────────────────────────────────────────────────────────────────┘   │
+│           │                                                                │
+│           ▼                                                                │
+│  ┌──────────────────────────────────────────────────────────────────┐   │
+│  │  第 2 层过滤：beforeSendTransaction()                              │   │
+│  │  ┌────────────────────────────────────────────────────────────┐  │   │
+│  │  │  event.request?.headers?.['x-healthcheck'] === 'true'      │  │   │
+│  │  │         │                                                     │  │   │
+│  │  │         ├── true  ──► return null  ◄── 丢弃，不发送         │  │   │
+│  │  │         │                                                     │  │   │
+│  │  │         └── false ──► return event  ◄── 继续，发送到 Sentry │  │   │
+│  │  └────────────────────────────────────────────────────────────┘  │   │
+│  └──────────────────────────────────────────────────────────────────┘   │
+│           │                                                                │
+│           ├── return null ───────────────────► 丢弃，不发送              │
+│           │                                                                │
+│           ▼ (return event)                                                 │
+│  ┌──────────────────────────────────────────────────────────────────┐   │
+│  │  ✅ 发送到 Sentry 服务器                                           │   │
+│  │  ├── Transaction 数据包含：                                        │   │
+│  │  │   ├── 总耗时                                                    │   │
+│  │  │   ├── 各阶段 Span（Prisma 查询等）                              │   │
+│  │  │   ├── 请求信息（URL、method、status code）                      │   │
+│  │  │   └── 环境信息                                                  │   │
+│  │  └── Sentry 服务端：                                               │   │
+│  │      ├── 性能分析 Dashboard                                         │   │
+│  │      ├── 慢请求识别                                                │   │
+│  │      └── 趋势分析                                                  │   │
+│  └──────────────────────────────────────────────────────────────────┘   │
+│                                                                           │
+└──────────────────────────────────────────────────────────────────────────┘
+```
+
+##### 双层过滤设计说明
+
+| 过滤层 | 函数 | 过滤依据 | 目的 |
+|--------|------|----------|------|
+| 第 1 层 | `tracesSampler` | URL 路径 | 基于 URL 模式快速过滤 |
+| 第 2 层 | `beforeSendTransaction` | HTTP Header | 基于请求头二次确认 |
+
+**为什么需要两层过滤**：
+1. **URL 过滤**（`tracesSampler`）：
+   - 快速过滤 `/resources/healthcheck` 等已知路径
+   - 在 Transaction 创建初期决定，减少不必要的开销
+
+2. **Header 过滤**（`beforeSendTransaction`）：
+   - 检查 `x-healthcheck: true` 头
+   - 有些健康检查可能通过不同的路径发送，但带有特殊 header
+   - 在发送前做最后的确认
+
+**健康检查过滤的重要性**：
+- 健康检查通常由负载均衡器（如 Consul、Nginx）频繁调用（可能每秒多次）
+- 这些请求没有业务价值，但会产生大量性能数据
+- 不过滤会：
+  - 增加 Sentry 事件数量（成本增加）
+  - 稀释真正的业务请求数据
+  - 影响性能趋势分析的准确性
+
+---
+
+#### 自动性能追踪集成
+
+服务端通过三个集成实现自动性能追踪：
+
+```typescript
+integrations: [
+	// 1. Prisma 查询追踪
+	Sentry.prismaIntegration({
+		prismaInstrumentation: new PrismaInstrumentation(),
+	}),
+	// 2. HTTP 请求追踪
+	Sentry.httpIntegration(),
+	// 3. Node.js 性能分析
+	nodeProfilingIntegration(),
+]
+```
+
+| 集成 | 包来源 | 功能说明 | 数据内容 |
+|------|--------|----------|----------|
+| `prismaIntegration` | `@sentry/react-router` | 自动追踪 Prisma 查询 | 查询类型、模型、耗时、参数 |
+| `PrismaInstrumentation` | `@prisma/instrumentation` | Prisma 官方 OpenTelemetry 集成 | 底层查询拦截和数据收集 |
+| `httpIntegration` | `@sentry/react-router` | 自动追踪 HTTP 请求 | 入站/出站请求、URL、状态码、耗时 |
+| `nodeProfilingIntegration` | `@sentry/profiling-node` | Node.js 性能分析 | CPU 使用情况、函数调用栈、内存分配 |
+
+**Prisma 集成工作原理**：
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    Prisma 查询自动追踪流程                        │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  业务代码调用                                                    │
+│  prisma.user.findUnique({ where: { id: '123' } })              │
+│           │                                                      │
+│           ▼                                                      │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │  PrismaInstrumentation (OpenTelemetry)                  │   │
+│  │  ├── 自动拦截 Prisma 查询                                │   │
+│  │  ├── 收集查询元数据：                                     │   │
+│  │  │   ├── 操作类型：findUnique                            │   │
+│  │  │   ├── 模型：User                                     │   │
+│  │  │   ├── 开始时间                                        │   │
+│  │  │   └── 查询参数（可选）                                │   │
+│  │  └── 查询完成时收集耗时                                   │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│           │                                                      │
+│           ▼                                                      │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │  Sentry.prismaIntegration                                │   │
+│  │  ├── 接收 OpenTelemetry 数据                             │   │
+│  │  ├── 转换为 Sentry Span 格式                            │   │
+│  │  └── 添加到当前 Transaction                              │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│           │                                                      │
+│           ▼                                                      │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │  Transaction 结构示例                                    │   │
+│  │  ├── 名称：GET /users/:id                                │   │
+│  │  ├── 总耗时：150ms                                       │   │
+│  │  └── Spans：                                              │   │
+│  │      ├── Span 1: db.sql.prisma                          │   │
+│  │      │   ├── 描述：SELECT FROM "User"                   │   │
+│  │      │   ├── 耗时：45ms                                 │   │
+│  │      │   └── 数据：{ model: 'User', operation: 'findUnique' } │
+│  │      └── Span 2: db.sql.prisma (如果有多个查询)         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Document-Policy 头配合**：
+
+在 `entry.server.tsx:38-40` 中，生产环境会添加特殊的响应头：
+
+```typescript
+if (process.env.NODE_ENV === 'production' && process.env.SENTRY_DSN) {
+	responseHeaders.append('Document-Policy', 'js-profiling')
+}
+```
+
+- `Document-Policy: js-profiling` 启用浏览器的 JavaScript Profiling API
+- 配合 `browserProfilingIntegration` 可以获取更详细的前端性能数据
+- 这是服务端和客户端性能监控的配合点
+
+---
+
 **文件位置**: `server/utils/monitoring.ts`
 
 #### 完整实现代码
@@ -1690,3 +2215,113 @@ export function getEnv() {
 │     │   ├── tracesSampler: 生产 100%, 开发 0%                   │
 │     │   └── beforeSendTransaction: 过滤健康检查                  │
 │     └── 服务端 Sentry 初始化完成                                   │
+└─────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────┐
+│                        客户端初始化流程                            │
+├─────────────────────────────────────────────────────────────────┤
+│  1. entry.client.tsx 检查条件                                    │
+│     └── if (ENV.MODE === 'production' && ENV.SENTRY_DSN)        │
+│                                                                   │
+│  2. 动态导入并初始化                                              │
+│     ├── void import('./utils/monitoring.client.tsx')             │
+│     │   └── .then(({ init }) => init())                          │
+│     └── app/utils/monitoring.client.tsx:init()                   │
+│         ├── Sentry.init({...})                                   │
+│         │   ├── dsn: ENV.SENTRY_DSN                              │
+│         │   ├── environment: ENV.MODE                             │
+│         │   ├── beforeSend: 过滤浏览器扩展错误                    │
+│         │   ├── integrations: [replay, browserProfiling]        │
+│         │   ├── tracesSampleRate: 1.0 (100%)                    │
+│         │   ├── replaysSessionSampleRate: 0.1 (10%)              │
+│         │   └── replaysOnErrorSampleRate: 1.0 (100%)            │
+│         └── 客户端 Sentry 初始化完成                               │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 设计要点总结
+
+#### Server-Timing 系统
+
+| 设计要点 | 实现方式 | 价值 |
+|----------|----------|------|
+| **结构化数据** | `Timings` 类型 + `makeTimings()` | 统一的计时数据格式 |
+| **自动计时** | `time()` 函数包装异步操作 | 无需手动管理计时器 |
+| **响应头转换** | `getServerTimeHeader()` + 自定义 `toString()` | 无缝集成 HTTP 响应 |
+| **缓存集成** | `cachifiedTimingReporter` | 缓存操作性能可见 |
+| **流式兼容** | `responseHeaders.append()` | SSR 阶段计时与 loader 计时合并 |
+
+#### Prisma 慢查询监控
+
+| 设计要点 | 实现方式 | 价值 |
+|----------|----------|------|
+| **事件驱动** | `$on('query')` + `emit: 'event'` | 灵活的查询监控 |
+| **可配置阈值** | `logThreshold = 20` | 适应不同环境需求 |
+| **快速返回** | `if (e.duration < logThreshold) return` | 减少不必要的开销 |
+| **颜色分级** | 5 级颜色系统 | 直观展示严重程度 |
+| **单例模式** | `remember('prisma', () => ...)` | 避免连接池耗尽 |
+
+#### Sentry 监控架构
+
+| 设计要点 | 实现方式 | 价值 |
+|----------|----------|------|
+| **前后端分离** | `monitoring.ts` + `monitoring.client.tsx` | 各环境独立配置 |
+| **条件初始化** | 动态 `import()` + 环境检查 | 开发环境无额外开销 |
+| **多层过滤** | `denyUrls` + `tracesSampler` + `beforeSend` | 减少噪音数据 |
+| **Prisma 集成** | `PrismaInstrumentation` + `prismaIntegration` | 数据库查询性能追踪 |
+| **会话重放** | `replayIntegration` + 分层采样 | 错误复现能力 |
+| **环境变量验证** | Zod Schema + `getEnv()` 白名单 | 类型安全 + 安全暴露 |
+
+---
+
+## 总结
+
+本文档详细分析了 Epic Stack 项目中的三个核心性能监控和错误追踪系统：
+
+### 1. Server-Timing 系统
+
+- **核心工具**：`timing.server.ts` 提供了完整的计时 API（`makeTimings`、`time`、`getServerTimeHeader`）
+- **使用场景**：
+  - **Root Loader**：追踪 `getUserId`、Prisma 查询等关键操作
+  - **Cache Provider**：通过 `cachifiedTimingReporter` 记录缓存操作耗时
+  - **SSR Render**：追踪 `renderToPipeableStream` 的 shell 渲染时间
+- **输出格式**：符合 W3C Server-Timing 规范的响应头，可在浏览器 DevTools 中直接查看
+
+### 2. Prisma 慢查询记录
+
+- **实现方式**：通过 `$on('query')` 事件监听 + 自定义日志逻辑
+- **核心配置**：
+  - 阈值：默认 20ms（可调整）
+  - 颜色分级：5 级颜色系统直观展示慢查询严重程度
+  - 快速返回：只处理超过阈值的查询，减少性能开销
+- **与 Sentry 互补**：
+  - 控制台日志：开发环境实时查看，快速定位
+  - Sentry 追踪：生产环境持久化记录，聚合分析
+
+### 3. Sentry 监控架构
+
+- **服务端配置**（`server/utils/monitoring.ts`）：
+  - 集成：Prisma 追踪、HTTP 监控、Node.js 性能分析
+  - 采样：生产环境 100%，开发环境 0%
+  - 过滤：健康检查、静态资源请求
+
+- **客户端配置**（`app/utils/monitoring.client.tsx`）：
+  - 集成：会话重放、浏览器性能分析
+  - 采样：性能追踪 100%，会话重放 10%（错误会话 100%）
+  - 过滤：浏览器扩展错误
+
+- **初始化流程**：
+  - 服务端：启动时立即初始化
+  - 客户端：生产环境动态导入，不阻塞首屏加载
+
+### 关键设计理念
+
+1. **非侵入式监控**：所有监控功能都是可选的，不影响核心业务逻辑
+2. **开发/生产差异**：开发环境减少噪音，生产环境完整追踪
+3. **多层过滤**：通过 URL、header、采样率等多层次减少无效数据
+4. **性能与价值平衡**：会话重放等高成本功能采用分层采样策略
+5. **类型安全**：使用 Zod 验证环境变量，TypeScript 确保类型一致性
+
+这些系统共同构成了一个完整的**可观测性体系**：
+- **开发阶段**：Server-Timing + Prisma 慢查询日志，实时性能反馈
+- **生产阶段**：Sentry 错误追踪 + 性能监控，持续改进的依据
