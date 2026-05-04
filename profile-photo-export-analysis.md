@@ -139,6 +139,252 @@ if (intent === 'delete') {
 5. 重定向
 ```
 
+### 1.5 对象存储与数据库一致性风险分析
+
+#### 场景一：上传成功但事务失败
+
+**当前代码顺序**（`photo.tsx:66-106`）：
+```
+1. uploadProfileImage() 上传到 S3/MinIO → 成功，文件已存在
+2. Prisma 事务 → 失败（网络问题、数据库宕机、约束冲突等）
+```
+
+**会发生什么？**
+
+| 影响项 | 具体后果 |
+|-------|---------|
+| **存储泄漏** | S3/MinIO 中存在孤立文件，无法通过数据库追踪 |
+| **用户体验** | 用户看到上传失败，但存储空间被占用 |
+| **成本累积** | 大量失败上传导致存储费用增加 |
+| **不可恢复** | 没有 objectKey 记录，无法定位和清理这些文件 |
+
+**对象键命名特点加剧问题**：
+```
+users/{userId}/profile-images/{timestamp}-{fileId}.{extension}
+```
+- `timestamp` + `fileId` 完全随机
+- 无法通过用户 ID 反向推导失败上传的文件
+- 即使扫描 `users/{userId}/profile-images/` 目录，也无法区分"有效但旧的文件"和"失败上传的文件"
+
+---
+
+#### 场景二：删除头像只删数据库不删对象
+
+**当前代码**（`photo.tsx:93-106`）：
+
+**删除操作**：
+```typescript
+if (intent === 'delete') {
+  await prisma.userImage.deleteMany({ where: { userId } })
+  // ❌ 没有调用 S3 DeleteObject
+  return redirect('/settings/profile')
+}
+```
+
+**替换操作（事务中）**：
+```typescript
+await prisma.$transaction(async ($prisma) => {
+  await $prisma.userImage.deleteMany({ where: { userId } })
+  // ❌ 事务中只删数据库，没有删旧的 S3 对象
+  await $prisma.user.update({ data: { image: { create: image } } })
+})
+```
+
+**会发生什么影响？**
+
+| 影响项 | 具体后果 |
+|-------|---------|
+| **存储泄漏** | 每次替换头像，旧文件遗留在 S3/MinIO 中 |
+| **成本累积** | 用户频繁更换头像 → 存储空间线性增长 |
+| **隐私风险** | 旧头像文件仍可访问（如果知道 URL），用户以为已删除 |
+| **数据残留** | 不符合 GDPR/CCPA 等"被遗忘权"要求 |
+
+**量化示例**：
+- 用户每月换 1 次头像，每次 2MB
+- 1 年后：12 个孤立文件 = 24MB 浪费
+- 10 万用户：2.4TB 存储浪费
+
+---
+
+#### 可执行的补救策略
+
+##### 策略 A：补偿式删除（推荐，改动最小）
+
+**上传失败场景**：在事务失败时尝试删除已上传的文件
+
+```typescript
+// 修改后的 action 逻辑
+export async function action({ request }: Route.ActionArgs) {
+  const userId = await requireUserId(request)
+  const formData = await parseFormData(request, { maxFileSize: MAX_SIZE })
+  
+  let uploadedObjectKey: string | null = null
+  
+  try {
+    const submission = await parseWithZod(formData, {
+      schema: PhotoFormSchema.transform(async (data) => {
+        if (data.intent === 'delete') return { intent: 'delete' }
+        uploadedObjectKey = await uploadProfileImage(userId, data.photoFile)
+        return {
+          intent: data.intent,
+          image: { objectKey: uploadedObjectKey },
+        }
+      }),
+      async: true,
+    })
+    
+    // ... 验证和事务处理
+  } catch (error) {
+    // 补偿：事务失败时尝试删除已上传的文件
+    if (uploadedObjectKey) {
+      try {
+        await deleteFromStorage(uploadedObjectKey)
+      } catch (deleteError) {
+        console.error('Failed to clean up uploaded file:', deleteError)
+        // 记录日志，后续由定时任务兜底
+      }
+    }
+    throw error
+  }
+}
+```
+
+**删除/替换场景**：先获取旧 objectKey，事务成功后删除
+
+```typescript
+// 替换头像的改进版本
+await prisma.$transaction(async ($prisma) => {
+  // 1. 先查询旧头像的 objectKey
+  const oldImage = await $prisma.userImage.findUnique({
+    where: { userId },
+    select: { objectKey: true },
+  })
+  
+  // 2. 删除旧记录
+  await $prisma.userImage.deleteMany({ where: { userId } })
+  
+  // 3. 创建新记录
+  await $prisma.user.update({
+    where: { id: userId },
+    data: { image: { create: image } },
+  })
+  
+  // 4. 返回旧 objectKey 供事务外删除
+  return oldImage?.objectKey
+})
+.then(async (oldObjectKey) => {
+  // 事务成功后，异步删除旧文件
+  if (oldObjectKey) {
+    try {
+      await deleteFromStorage(oldObjectKey)
+    } catch (error) {
+      console.error('Failed to delete old profile image:', error)
+    }
+  }
+})
+```
+
+---
+
+##### 策略 B：定时任务兜底（必要补充）
+
+即使有补偿删除，也可能因为：
+- 补偿删除本身失败（网络问题）
+- 进程崩溃（没机会执行 catch 块）
+- 并发场景导致竞态
+
+**需要实现的清理任务**：
+
+```typescript
+// 定期扫描的清理逻辑
+async function cleanupOrphanedImages() {
+  // 1. 从数据库获取所有有效的 objectKey
+  const validKeys = new Set(
+    (await prisma.userImage.findMany({ select: { objectKey: true } }))
+      .map(img => img.objectKey)
+  )
+  
+  // 2. 扫描 S3/MinIO 中的 profile-images 目录
+  const s3Objects = await listStorageObjects('users/*/profile-images/')
+  
+  // 3. 找出不在数据库中的孤立文件
+  const orphanedKeys = s3Objects.filter(obj => !validKeys.has(obj.Key))
+  
+  // 4. 删除孤立文件（或先标记，人工确认后再删）
+  for (const key of orphanedKeys) {
+    await deleteFromStorage(key)
+    console.log(`Deleted orphaned image: ${key}`)
+  }
+}
+```
+
+**执行频率建议**：
+- 开发环境：每天一次
+- 生产环境：每周一次（或每月，视存储成本压力）
+
+---
+
+##### 策略 C：软删除 + 延迟清理（最安全）
+
+**核心思想**：不立即删除，标记为待删除，一段时间后再清理
+
+```typescript
+// 方案：UserImage 表增加 status 字段
+model UserImage {
+  id        String   @id @default(cuid())
+  objectKey String
+  status    String   @default("active") // active | pending_deletion
+  deletedAt DateTime?
+  
+  // ... 其他字段
+}
+```
+
+**工作流**：
+```
+用户删除/替换头像
+    ↓
+更新数据库 status = 'pending_deletion', deletedAt = NOW()
+    ↓
+定时任务扫描：status='pending_deletion' AND deletedAt < NOW()-7天
+    ↓
+确认文件不再被引用 → 同时删除数据库记录 + S3 对象
+```
+
+**优势**：
+- 可恢复：7 天内用户后悔可以恢复
+- 安全：给缓存、CDN 足够的失效时间
+- 可审计：有删除时间记录
+
+---
+
+#### 存储删除功能实现
+
+当前 `storage.server.ts` 只有上传和获取签名，缺少删除函数：
+
+```typescript
+// 需要新增的函数
+export async function deleteFromStorage(key: string) {
+  const { url, headers } = getSignedDeleteRequestInfo(key)
+  
+  const response = await fetch(url, {
+    method: 'DELETE',
+    headers,
+  })
+  
+  if (!response.ok) {
+    throw new Error(`Failed to delete object: ${key}, status: ${response.status}`)
+  }
+}
+
+function getSignedDeleteRequestInfo(key: string) {
+  return getBaseSignedRequestInfo({
+    method: 'DELETE',
+    key,
+  })
+}
+```
+
 ---
 
 ## 二、用户数据导出的敏感字段裁剪
