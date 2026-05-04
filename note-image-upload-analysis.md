@@ -678,3 +678,510 @@ BUCKET_NAME="your-bucket-name"
 4. **符合 Epic Stack 哲学**: "Convention over Configuration"，提供开箱即用的方案
 
 对于大多数中小型应用，这种设计是完全合适的。只有当上传量非常大（每天数百万次上传）时，才需要考虑改为真正的客户端直传架构以减轻应用服务器的压力。
+
+---
+
+## 补充分析：失败路径、安全边界与残留处理
+
+### 7. 失败路径：上传失败后错误如何回传到页面
+
+#### 7.1 错误抛出点
+
+**文件位置**: `app/utils/storage.server.ts:20-24`
+
+```typescript
+if (!uploadResponse.ok) {
+  const errorMessage = `Failed to upload file to storage. Server responded with ${uploadResponse.status}: ${uploadResponse.statusText}`
+  console.error(errorMessage)
+  throw new Error(`Failed to upload object: ${key}`)
+}
+```
+
+#### 7.2 错误传播链
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                        错误传播链                                      │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│  1. 对象存储返回非 2xx 响应                                          │
+│     │                                                                │
+│     ▼                                                                │
+│  2. uploadToStorage() 抛出 Error                                   │
+│     │                                                                │
+│     ▼                                                                │
+│  3. uploadNoteImage() 被 await，Error 继续向上抛出                   │
+│     │                                                                │
+│     ▼                                                                │
+│  4. Zod .transform() 回调中的 Promise.all 被 reject                │
+│     │                                                                │
+│     ▼                                                                │
+│  5. parseWithZod() 捕获错误，标记 submission.status = 'error'      │
+│     │                                                                │
+│     ▼                                                                │
+│  6. action 返回 { result: submission.reply() }                      │
+│     │                                                                │
+│     ▼                                                                │
+│  7. 前端 useForm() 获取 lastResult，通过 ErrorList 渲染错误          │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+#### 7.3 服务端错误处理
+
+**文件位置**: `app/routes/users/$username/notes/+shared/note-editor.server.tsx:85-90`
+
+```typescript
+if (submission.status !== 'success') {
+  return data(
+    { result: submission.reply() },  // 将错误信息返回给前端
+    { status: submission.status === 'error' ? 400 : 200 },
+  )
+}
+```
+
+**关键点**:
+- `submission.reply()` 会保留表单验证状态和错误信息
+- 这使得用户可以修正错误后重新提交，而不是丢失所有已填内容
+
+#### 7.4 前端错误渲染
+
+**文件位置**: `app/components/forms.tsx:17-35` - ErrorList 组件
+
+```tsx
+export function ErrorList({
+  id,
+  errors,
+}: {
+  errors?: ListOfErrors
+  id?: string
+}) {
+  const errorsToRender = errors?.filter(Boolean)
+  if (!errorsToRender?.length) return null
+  return (
+    <ul id={id} className="flex flex-col gap-1">
+      {errorsToRender.map((e) => (
+        <li key={e} className="text-foreground-destructive text-[10px]">
+          {e}
+        </li>
+      ))}
+    </ul>
+  )
+}
+```
+
+**文件位置**: `app/routes/users/$username/notes/+shared/note-editor.tsx:155, 259, 270-273, 278`
+
+```tsx
+// 表单级错误
+<ErrorList id={form.errorId} errors={form.errors} />
+
+// 文件字段级错误
+<ErrorList id={fields.file.errorId} errors={fields.file.errors} />
+
+// altText 字段级错误
+<ErrorList
+  id={fields.altText.errorId}
+  errors={fields.altText.errors}
+/>
+
+// 图片组级错误
+<ErrorList id={meta.errorId} errors={meta.errors} />
+```
+
+#### 7.5 文件大小限制的前端验证
+
+**文件位置**: `app/routes/users/$username/notes/+shared/note-editor.tsx:31-42`
+
+```tsx
+export const MAX_UPLOAD_SIZE = 1024 * 1024 * 3 // 3MB
+
+const ImageFieldsetSchema = z.object({
+  id: z.string().optional(),
+  file: z
+    .instanceof(File)
+    .optional()
+    .refine((file) => {
+      return !file || file.size <= MAX_UPLOAD_SIZE
+    }, 'File size must be less than 3MB'),  // 前端验证消息
+  altText: z.string().optional(),
+})
+```
+
+**文件位置**: `app/routes/users/$username/notes/+shared/note-editor.server.tsx:30-32`
+
+```typescript
+const formData = await parseFormData(request, {
+  maxFileSize: MAX_UPLOAD_SIZE,  // 服务端也限制
+})
+```
+
+#### 7.6 失败路径的安全考量
+
+| 失败场景 | 处理方式 | 安全性 |
+|---------|---------|--------|
+| 对象存储返回 4xx/5xx | 抛出 Error，通过 Conform 回传 | 仅返回通用错误信息，不暴露存储细节 |
+| 文件超过大小限制 | Zod refine + parseFormData 双重限制 | 前后端都校验，防止绕过 |
+| 网络超时 | fetch 默认超时或抛出 NetworkError | 需要依赖 Node.js fetch 实现 |
+| 并发上传部分失败 | Promise.all 快速失败，全部回滚 | ❌ 问题：已上传的文件不会被清理！ |
+
+**⚠️ 重要问题**: 当前实现使用 `Promise.all`，如果其中一个图片上传失败：
+- 整个 `transform` 回调会失败
+- 数据库操作不会执行
+- **但已成功上传到对象存储的文件会成为孤儿文件！**
+
+---
+
+### 8. 安全边界：签名有效期与对象归属约束
+
+#### 8.1 签名有效期分析
+
+**当前实现的签名特点**:
+
+**文件位置**: `app/utils/storage.server.ts:92-100`
+
+```typescript
+// 构建日期字符串
+const amzDate = new Date().toISOString().replace(/[:-]|\.\d{3}/g, '')
+// 格式: 20260504T123456Z
+
+const dateStamp = amzDate.slice(0, 8)
+// 格式: 20260504
+
+// 签名时使用的凭证范围
+const credentialScope = `${dateStamp}/${STORAGE_REGION}/s3/aws4_request`
+```
+
+**与标准 Presigned URL 的对比**:
+
+| 特性 | 当前实现 (Header 签名) | 标准 Presigned URL (Query 签名) |
+|------|----------------------|-------------------------------|
+| 签名传递方式 | Authorization 请求头 | X-Amz-* 查询参数 |
+| 有效期控制 | 无显式 `X-Amz-Expires` | 通过 `X-Amz-Expires` 参数控制 |
+| 实际有效期 | 由服务端时钟偏差容忍度决定 | 明确的秒数 (如 900 = 15分钟) |
+| 适用场景 | 服务端即时使用 | 客户端预签名后延迟使用 |
+
+**当前实现的"有效期"分析**:
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                    签名时间线                                         │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│  T = 0: 服务端生成签名                                                │
+│         - amzDate = "20260504T123456Z"                            │
+│         - dateStamp = "20260504"                                    │
+│                                                                     │
+│  T = 几秒内: 服务端使用签名发起 PUT 请求                              │
+│         - 对象存储验证 X-Amz-Date                                    │
+│         - 大多数 S3 实现允许 ±15 分钟的时钟偏差                      │
+│                                                                     │
+│  T = 1小时后: 签名已"过期"                                           │
+│         - 虽然没有显式的 Expires 参数                                │
+│         - 但 dateStamp 是 20260504，第二天就无法使用                │
+│         - 且 amzDate 与服务器时间偏差过大也会被拒绝                  │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+**关键结论**:
+- 当前实现的签名**设计为即时使用**，不适合长时间保存
+- 签名中的 `dateStamp` 限制了签名只能在**同一天内**使用
+- 对象存储服务通常还有额外的时钟偏差检查（如 ±15 分钟）
+
+#### 8.2 对象归属约束
+
+**多层防护机制**:
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                    对象归属约束层次                                    │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│  第 1 层: 身份验证 (Authentication)                                  │
+│  ─────────────────────────────────                                   │
+│  文件: note-editor.server.tsx:28                                    │
+│  const userId = await requireUserId(request)                        │
+│  - 确保用户已登录                                                    │
+│  - 未登录用户无法访问任何上传功能                                     │
+│                                                                     │
+│  第 2 层: 路径命名空间 (Path Namespace)                              │
+│  ────────────────────────────────────────                            │
+│  文件: storage.server.ts:40-50                                      │
+│  const key = `users/${userId}/notes/${noteId}/images/...`          │
+│  - 所有用户的文件都隔离在各自的 users/{userId}/ 目录下              │
+│  - 即使有越权访问，也无法通过路径猜测访问其他用户的文件               │
+│                                                                     │
+│  第 3 层: 笔记所有权验证 (Note Ownership)                            │
+│  ──────────────────────────────────────────                          │
+│  文件: note-editor.server.tsx:38-47                                 │
+│  const note = await prisma.note.findUnique({                        │
+│    where: { id: data.id, ownerId: userId },  // 关键: ownerId 校验  │
+│  })                                                                  │
+│  if (!note) {                                                        │
+│    ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'Note not found' }) │
+│  }                                                                   │
+│  - 用户只能操作自己拥有的笔记                                         │
+│  - 尝试修改他人笔记会被拒绝                                           │
+│                                                                     │
+│  第 4 层: 数据库外键约束 (Database FK)                               │
+│  ───────────────────────────────────────                             │
+│  文件: prisma/migrations/.../migration.sql:19, 30, 41             │
+│  - NoteImage.noteId → Note.id (ON DELETE CASCADE)                  │
+│  - Note.ownerId → User.id (ON DELETE CASCADE)                       │
+│  - 数据库层面保证数据完整性                                           │
+│                                                                     │
+│  第 5 层: 图片访问代理 (Image Access Proxy)                          │
+│  ────────────────────────────────────────                            │
+│  文件: resources/images.tsx                                          │
+│  - 所有图片访问都通过 /resources/images 代理                         │
+│  - 虽然当前没有实现按用户过滤，但架构支持扩展                         │
+│  - 可以轻松添加权限检查、水印、格式转换等功能                          │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+#### 8.3 存储路径的安全设计
+
+```typescript
+// storage.server.ts:48
+const key = `users/${userId}/notes/${noteId}/images/${timestamp}-${fileId}.${fileExtension}`
+```
+
+**路径组件分析**:
+
+| 组件 | 作用 | 安全性 |
+|------|------|--------|
+| `users/${userId}` | 用户隔离 | 防止越权访问其他用户文件 |
+| `notes/${noteId}` | 笔记隔离 | 同一用户的不同笔记文件分离 |
+| `images/` | 类型分类 | 便于管理和批量操作 |
+| `${timestamp}` | 时间戳 | 防止文件名冲突，便于排序 |
+| `${fileId}` | CUID | 全局唯一，不可预测 |
+| `${fileExtension}` | 扩展名 | 保留原始文件类型 |
+
+**CUID 的安全特性**:
+- 使用加密安全的随机数生成
+- 包含时间戳和计数器
+- 冲突概率极低 (比 UUID v4 更低)
+- 不可预测，防止暴力枚举
+
+---
+
+### 9. 残留处理：删图后对象存储残留问题
+
+#### 9.1 当前实现的删除逻辑
+
+**文件位置**: `app/routes/users/$username/notes/+shared/note-editor.server.tsx:113-125`
+
+```typescript
+images: {
+  // 只删除数据库记录！
+  deleteMany: { id: { notIn: imageUpdates.map((i) => i.id) } },
+  
+  updateMany: imageUpdates.map((updates) => ({
+    where: { id: updates.id },
+    data: {
+      ...updates,
+      id: updates.objectKey ? cuid() : updates.id,
+    },
+  })),
+  
+  create: newImages,
+}
+```
+
+**笔记删除时的行为**:
+
+**文件位置**: `app/routes/users/$username/notes/$noteId.tsx:83`
+
+```typescript
+await prisma.note.delete({ where: { id: note.id } })
+// 由于 ON DELETE CASCADE，NoteImage 记录会被自动删除
+// 但对象存储中的文件不会被删除！
+```
+
+#### 9.2 残留文件场景分析
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                    残留文件产生场景                                    │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│  场景 1: 更新图片时替换旧文件                                         │
+│  ────────────────────────────────                                    │
+│  - 用户编辑笔记，上传新图片替换旧图片                                  │
+│  - 新图片上传成功，获得新的 objectKey                                 │
+│  - 数据库更新为新的 objectKey                                        │
+│  - ❌ 旧图片的 objectKey 对应的文件仍在对象存储中                     │
+│                                                                     │
+│  场景 2: 删除单张图片                                                 │
+│  ───────────────────────                                             │
+│  - 用户在编辑器中点击"Remove image"按钮                              │
+│  - 提交后，deleteMany 删除数据库记录                                  │
+│  - ❌ 对象存储中的文件未被删除                                        │
+│                                                                     │
+│  场景 3: 删除整个笔记                                                 │
+│  ───────────────────────                                             │
+│  - 用户点击"Delete Note"删除整个笔记                                 │
+│  - prisma.note.delete() 执行                                         │
+│  - ON DELETE CASCADE 删除 NoteImage 记录                             │
+│  - ❌ 所有关联图片文件仍在对象存储中                                   │
+│                                                                     │
+│  场景 4: 上传部分成功后失败                                           │
+│  ─────────────────────────────                                       │
+│  - 用户上传 5 张图片                                                  │
+│  - 前 3 张上传成功，第 4 张失败                                       │
+│  - Promise.all 全部失败，数据库未写入                                 │
+│  - ❌ 前 3 张已上传的文件成为孤儿文件                                  │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+#### 9.3 当前实现的缺失功能
+
+**代码库中没有**:
+
+| 功能 | 文件 | 状态 |
+|------|------|------|
+| DELETE 请求签名函数 | `storage.server.ts` | ❌ 缺失 |
+| 删除对象存储文件的函数 | `storage.server.ts` | ❌ 缺失 |
+| 清理孤儿文件的定时任务 | 整个项目 | ❌ 缺失 |
+| 软删除/垃圾回收标记 | 数据库 schema | ❌ 缺失 |
+
+**验证**:
+
+```typescript
+// storage.server.ts 中只导出了:
+export async function uploadProfileImage(...)  // ✅ 上传
+export async function uploadNoteImage(...)      // ✅ 上传
+export function getSignedGetRequestInfo(...)    // ✅ GET 签名
+// ❌ 没有 deleteFromStorage
+// ❌ 没有 getSignedDeleteRequestInfo
+```
+
+#### 9.4 推荐的改进方案
+
+**方案 A: 同步删除 (简单但有风险)**
+
+```typescript
+// 在 storage.server.ts 中添加
+export async function deleteFromStorage(key: string) {
+  const { url, headers } = getSignedDeleteRequestInfo(key)
+  const response = await fetch(url, { method: 'DELETE', headers })
+  if (!response.ok) {
+    console.error(`Failed to delete object: ${key}`)
+  }
+}
+
+// 在 note-editor.server.tsx 的 update 操作中
+// 需要先查询旧的 objectKey，然后删除
+```
+
+**风险**:
+- 删除操作失败时如何处理？
+- 并发更新时可能误删正在使用的文件
+- 数据库事务和存储删除无法原子化
+
+**方案 B: 软删除 + 定时清理 (推荐)**
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                    软删除 + 定时清理流程                               │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│  1. 用户删除图片时:                                                  │
+│     - 不立即删除对象存储文件                                          │
+│     - 在数据库标记 deletedAt = now()                                │
+│     - 或使用新表记录待删除的 objectKey                               │
+│                                                                     │
+│  2. 定时任务 (如每天凌晨):                                           │
+│     - 查询所有 deletedAt < now() - 24h 的记录                       │
+│     - 批量从对象存储删除这些文件                                      │
+│     - 删除成功后清理数据库记录                                        │
+│                                                                     │
+│  3. 优势:                                                            │
+│     - 有 24 小时的"后悔期"，可恢复误删文件                           │
+│     - 批量删除减少 API 调用次数                                      │
+│     - 失败可重试，不影响用户操作                                      │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+**方案 C: 使用对象存储的生命周期规则**
+
+```yaml
+# Tigris/S3 生命周期配置示例
+{
+  "Rules": [
+    {
+      "ID": "Clean up temporary uploads",
+      "Prefix": "temp/",
+      "Status": "Enabled",
+      "Expiration": {
+        "Days": 1
+      }
+    },
+    {
+      "ID": "Archive old images",
+      "Prefix": "users/",
+      "Status": "Enabled",
+      "Transitions": [
+        {
+          "Days": 365,
+          "StorageClass": "GLACIER"
+        }
+      ]
+    }
+  ]
+}
+```
+
+**局限性**:
+- 无法精确对应数据库的删除操作
+- 适合处理临时文件，不适合精确的用户删除操作
+
+#### 9.5 残留文件的影响
+
+| 影响类型 | 程度 | 说明 |
+|---------|------|------|
+| 存储成本 | 中 | 持续累积会增加存储费用 |
+| 数据合规 | 高 | 用户要求删除数据时，物理文件仍存在 |
+| 安全风险 | 低 | 路径不可预测，且有访问代理保护 |
+| 性能影响 | 低 | 对象存储通常能处理大量文件 |
+
+---
+
+## 完整安全检查表
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                    安全检查清单                                        │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│  ✅ 已实现的安全措施:                                                │
+│  ──────────────────────                                              │
+│  [x] 签名完全在服务端生成，密钥永不暴露                               │
+│  [x] requireUserId 强制身份验证                                      │
+│  [x] 笔记操作前验证 ownerId                                          │
+│  [x] 存储路径按 userId 隔离                                          │
+│  [x] 文件大小前后端双重校验                                           │
+│  [x] CUID 不可预测的文件名                                           │
+│  [x] 图片访问通过应用服务器代理                                       │
+│                                                                     │
+│  ⚠️ 部分实现/需注意:                                                  │
+│  ────────────────────────                                            │
+│  [~] 签名无显式有效期，但隐含日期限制                                  │
+│  [~] 错误信息通过 Conform 回传，但可能暴露实现细节                    │
+│                                                                     │
+│  ❌ 缺失的安全/功能:                                                  │
+│  ──────────────────────                                              │
+│  [ ] 对象存储文件删除功能                                             │
+│  [ ] 孤儿文件清理机制                                                 │
+│  [ ] 上传失败后的回滚清理                                             │
+│  [ ] 图片访问的权限检查 (当前所有人都可访问)                          │
+│  [ ] 图片内容类型验证 (防止上传非图片文件)                            │
+│  [ ] 病毒扫描/恶意内容检测                                           │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
