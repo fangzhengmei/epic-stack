@@ -827,17 +827,39 @@ export default function NotesRoute({ loaderData }: Route.ComponentProps) {
 
 ```typescript
 export async function loader({ request }: Route.LoaderArgs) {
-  await requireUserId(request)  // 只检查是否登录
+  await requireUserId(request)  // 强制要求已登录
   return {}
 }
 ```
 
-**问题**：任何人只要知道 URL `/users/xxx/notes/new`，都可以直接访问！
+**`requireUserId` 的行为**（`app/utils/auth.server.ts:49-67`）：
 
-例如：
-- 用户 B 直接访问 `/users/userA/notes/new`
-- 服务端 loader 只检查 `requireUserId`
-- 用户 B 能看到新建笔记表单
+```typescript
+export async function requireUserId(
+  request: Request,
+  { redirectTo }: { redirectTo?: string | null } = {},
+) {
+  const userId = await getUserId(request)
+  if (!userId) {
+    // ⚠️ 未登录用户会被重定向到登录页
+    const requestUrl = new URL(request.url)
+    redirectTo =
+      redirectTo === null
+        ? null
+        : (redirectTo ?? `${requestUrl.pathname}${requestUrl.search}`)
+    const loginParams = redirectTo ? new URLSearchParams({ redirectTo }) : null
+    const loginRedirect = ['/login', loginParams?.toString()]
+      .filter(Boolean)
+      .join('?')
+    throw redirect(loginRedirect)  // 重定向到登录页
+  }
+  return userId
+}
+```
+
+**实际行为**：
+- **未登录用户**：访问 `/users/xxx/notes/new` 会被重定向到 `/login?redirectTo=...`
+- **已登录用户**：正常访问新建笔记表单
 
 #### (3) 服务端 Action
 
@@ -845,7 +867,7 @@ export async function loader({ request }: Route.LoaderArgs) {
 
 ```typescript
 export async function action({ request }: ActionFunctionArgs) {
-  const userId = await requireUserId(request)  // 只检查是否登录
+  const userId = await requireUserId(request)  // 强制要求已登录
 
   const formData = await parseFormData(request, { maxFileSize: MAX_UPLOAD_SIZE })
 
@@ -870,7 +892,7 @@ export async function action({ request }: ActionFunctionArgs) {
     where: { id: noteId },
     create: {
       id: noteId,
-      ownerId: userId,  // ⚠️ 新建时自动设置为当前用户
+      ownerId: userId,  // ✅ 新建时自动设置为当前用户
       title,
       content,
       images: { create: newImages },
@@ -884,10 +906,10 @@ export async function action({ request }: ActionFunctionArgs) {
 }
 ```
 
-**创建操作的实际行为**：
+**创建操作的实际行为**（正确的设计）：
 
-1. 用户 B 直接访问 `/users/userA/notes/new`
-2. 能看到新建笔记表单
+1. 用户 B（已登录）直接访问 `/users/userA/notes/new`
+2. 能看到新建笔记表单（因为已登录）
 3. 填写内容并提交
 4. 服务端创建笔记，`ownerId` 自动设置为 **用户 B 的 ID**（不是 userA）
 5. 重定向到 `/users/userB/notes/new-note-id`
@@ -895,7 +917,9 @@ export async function action({ request }: ActionFunctionArgs) {
 **结果**：
 - 虽然用户 B 在 `/users/userA/notes/new` 页面创建笔记
 - 但笔记的实际所有者是 **用户 B**
-- 这是通过 `ownerId: userId` 隐式保证的
+- 这是通过 `ownerId: userId` 显式保证的——**最终只能给自己创建笔记**
+
+**这是正确的设计**：URL 中的 `username` 只是页面路径上下文，不影响笔记的实际归属。
 
 #### (4) 创建操作的权限系统对比
 
