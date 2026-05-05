@@ -320,14 +320,43 @@ export const PasskeyCookieSchema = z.object({
 - 认证：GET `/webauthn/authentication` 返回响应时
 
 **清理时机：**
-- ✅ 注册成功：`{ maxAge: 0 }` 立即删除
-- ✅ 认证成功：`{ maxAge: 0 }` 立即删除
-- ✅ 认证失败：`{ headers: { 'Set-Cookie': deletePasskeyCookie } }`
+
+| 场景 | 注册流程 (`registration.ts`) | 认证流程 (`authentication.ts`) |
+|------|------------------------------|-------------------------------|
+| ✅ 成功 | `{ maxAge: 0 }` 立即删除 | `{ maxAge: 0 }` 立即删除 |
+| ⚠️ 失败 | **无清理**（cookie 保留至 2 小时超时） | `{ headers: { 'Set-Cookie': deletePasskeyCookie } }` 立即删除 |
+
+**注册失败时的 Cookie 处理策略分析：**
+
+注册流程的 catch 块代码（`registration.ts:149-135`）：
+```typescript
+} catch (error) {
+    if (error instanceof Response) throw error
+    return Response.json(
+        { status: 'error', error: getErrorMessage(error) } as const,
+        { status: 400 },
+        // 注意：这里没有 Set-Cookie 头来删除 webauthn-challenge
+    )
+}
+```
+
+对比认证流程的 catch 块（`authentication.ts:102-112`）：
+```typescript
+} catch (error) {
+    if (error instanceof Response) throw error
+    return Response.json(
+        { status: 'error', error: ... },
+        { status: 400, headers: { 'Set-Cookie': deletePasskeyCookie } }
+        // 注意：这里显式删除了 cookie
+    )
+}
+```
 
 **安全设计：**
 1. 挑战一次性使用，验证后立即失效
 2. Cookie 与 session 分离，passkey 流程专用
 3. 2 小时超时，防止长期悬挂的挑战
+4. **注意**：注册失败时 cookie 不会立即删除，依赖 2 小时过期机制
 
 ---
 
