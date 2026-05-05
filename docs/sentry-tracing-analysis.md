@@ -22,7 +22,7 @@
 
 #### 2.1.1 仓库显式配置
 
-**文件位置**: `app/utils/monitoring.client.tsx`
+**文件位置 1**: `app/utils/monitoring.client.tsx` - Sentry 初始化
 
 ```typescript
 import * as Sentry from '@sentry/react-router'
@@ -60,22 +60,43 @@ if (ENV.MODE === 'production' && ENV.SENTRY_DSN) {
 }
 ```
 
-**显式错误捕获**: `app/components/error-boundary.tsx`
+**文件位置 2**: `app/components/error-boundary.tsx` - 客户端错误捕获（关键！）
 
 ```typescript
 import { captureException } from '@sentry/react-router'
+import { useEffect, type ReactElement } from 'react'
 
-export function GeneralErrorBoundary(...) {
+export function GeneralErrorBoundary({...}) {
     const error = useRouteError()
     const isResponse = isRouteErrorResponse(error)
 
+    // 关键点 1: typeof document !== 'undefined' 检查
+    // 这是客户端环境检查，但只是用于 console.error
+    if (typeof document !== 'undefined') {
+        console.error(error)
+    }
+
+    // 关键点 2: useEffect 中调用 captureException
+    // useEffect 只在客户端执行！服务端 SSR 时不执行
     useEffect(() => {
-        if (isResponse) return  // 显式：忽略 HTTP 响应类型错误
-        captureException(error)   // 显式：手动调用捕获
+        if (isResponse) return  // 显式：忽略 HTTP 响应类型错误（如 404）
+        captureException(error)   // 显式：客户端错误捕获
     }, [error, isResponse])
+
     // ...
 }
 ```
+
+**关键分析**：
+- `GeneralErrorBoundary` 是 React Router 路由错误边界组件
+- 但 `captureException(error)` 调用在 `useEffect` 中
+- `useEffect` 只在**客户端 Hydration 后执行**
+- 服务端 SSR 渲染时 `useEffect` 不执行，所以不会调用 `captureException`
+- **结论：这是客户端的错误捕获配置**
+
+**使用位置**：`GeneralErrorBoundary` 被以下位置导出为 `ErrorBoundary`：
+- `app/root.tsx:263` - `export const ErrorBoundary = GeneralErrorBoundary`
+- 多个路由文件如 `app/routes/$.tsx`、`app/routes/users/index.tsx` 等
 
 #### 2.1.2 SDK 默认行为（仓库未显式配置）
 
@@ -104,7 +125,7 @@ export function GeneralErrorBoundary(...) {
 
 #### 2.2.1 仓库显式配置
 
-**文件位置**: `server/utils/monitoring.ts`
+**文件位置 1**: `server/utils/monitoring.ts` - Sentry 初始化
 
 ```typescript
 import { PrismaInstrumentation } from '@prisma/instrumentation'
@@ -157,15 +178,16 @@ if (SENTRY_ENABLED) {
 }
 ```
 
-**显式错误捕获 1**: `app/entry.server.tsx`
+**文件位置 2**: `app/entry.server.tsx` - 服务端错误捕获（关键！）
 
 ```typescript
 export function handleError(
     error: unknown,
     { request }: LoaderFunctionArgs | ActionFunctionArgs,
 ): void {
+    // 显式：忽略已中止的请求（如用户取消导航）
     if (request.signal.aborted) {
-        return  // 显式：忽略已中止的请求
+        return
     }
 
     if (error instanceof Error) {
@@ -174,11 +196,19 @@ export function handleError(
         console.error(error)
     }
 
-    Sentry.captureException(error)  // 显式：手动捕获
+    // 显式：服务端错误捕获
+    // 这个函数在服务端的 Loader/Action 抛出错误时被 React Router 调用
+    Sentry.captureException(error)
 }
 ```
 
-**显式错误捕获 2**: `server/index.ts` (进程优雅关闭)
+**关键分析**：
+- `handleError` 是 React Router 服务端入口 `entry.server.tsx` 的导出
+- 这个函数在**服务端**执行，处理 SSR 期间的 Loader/Action 错误
+- 与客户端的 `GeneralErrorBoundary` 是**两套不同的错误捕获机制**
+- **结论：这是服务端的错误捕获配置**
+
+**文件位置 3**: `server/index.ts` - 进程退出错误捕获
 
 ```typescript
 closeWithGrace(async ({ err }) => {
@@ -187,13 +217,19 @@ closeWithGrace(async ({ err }) => {
     })
     if (err) {
         console.error(styleText('red', String(err)))
+        console.error(styleText('red', String(err.stack)))
         if (SENTRY_ENABLED) {
-            Sentry.captureException(err)       // 显式
+            Sentry.captureException(err)       // 显式：进程退出错误捕获
             await Sentry.flush(500)             // 显式：确保事件发送完成
         }
     }
 })
 ```
+
+**关键分析**：
+- `closeWithGrace` 在进程收到 `SIGTERM` 或 `SIGINT` 信号时执行
+- 捕获的是**进程级别的错误**，不是特定请求的错误
+- 这些错误**无法关联到具体请求**（因为可能在请求上下文之外）
 
 **显式构建配置**: `vite.config.ts`
 
@@ -252,6 +288,11 @@ const sentryConfig: SentryReactRouterBuildOptions = {
 
 3. 项目架构：使用 **Express + Node.js**，不是 Vercel Edge Runtime
 
+4. React Router v7 的边缘中间件需要：
+   - `middleware.ts` 文件在 `app/` 目录
+   - 使用 `export const config = { runtime: 'edge' }`
+   - 边缘运行时有诸多限制（不支持 Node.js 原生模块）
+
 #### 2.3.2 如果需要边缘中间件，参考配置
 
 如果未来需要添加边缘中间件的 Sentry 支持，典型配置如下：
@@ -288,9 +329,70 @@ export function init() {
 
 ---
 
-## 三、显式配置 vs SDK 默认行为 对比总表
+## 三、错误捕获边界：客户端 vs 服务端 详细对比
 
-### 3.1 客户端
+### 3.1 两套独立的错误捕获机制
+
+Epic Stack 实现了**两套独立的错误捕获机制**，分别负责不同环境：
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                           一次完整的请求流程                               │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                           │
+│  1. 服务端 SSR 阶段                                                       │
+│     ┌─────────────────────────────────────────────────────────────┐    │
+│     │  浏览器请求 → Express → React Router SSR                     │    │
+│     │                                                               │    │
+│     │  如果 Loader/Action 抛出错误：                                │    │
+│     │    → React Router 调用 entry.server.tsx 的 handleError      │    │
+│     │    → handleError 调用 Sentry.captureException(error)        │    │
+│     │    └── 这是【服务端】的错误捕获                               │    │
+│     └─────────────────────────────────────────────────────────────┘    │
+│                                                                           │
+│  2. 客户端 Hydration 阶段                                                 │
+│     ┌─────────────────────────────────────────────────────────────┐    │
+│     │  浏览器接收 HTML → Hydration → 客户端路由接管                │    │
+│     │                                                               │    │
+│     │  如果客户端导航时路由错误：                                    │    │
+│     │    → React Router 渲染 ErrorBoundary (GeneralErrorBoundary) │    │
+│     │    → GeneralErrorBoundary 的 useEffect 执行                  │    │
+│     │    → useEffect 中调用 captureException(error)                │    │
+│     │    └── 这是【客户端】的错误捕获                               │    │
+│     └─────────────────────────────────────────────────────────────┘    │
+│                                                                           │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### 3.2 详细对比表
+
+| 维度 | 客户端错误捕获 | 服务端错误捕获 |
+|------|---------------|----------------|
+| **触发时机** | 客户端 Hydration 后、客户端导航时 | 服务端 SSR 期间、Loader/Action 执行时 |
+| **配置位置** | `app/components/error-boundary.tsx` | `app/entry.server.tsx` |
+| **执行环境** | 浏览器 | Node.js |
+| **关键代码** | `useEffect(() => { captureException(error) })` | `export function handleError(...) { Sentry.captureException(error) }` |
+| **关键特征** | 在 `useEffect` 中调用（仅客户端执行） | 作为 React Router 服务端入口的 `handleError` 导出 |
+| **捕获的错误类型** | 客户端路由错误、组件渲染错误 | 服务端 Loader/Action 错误、SSR 错误 |
+| **是否关联请求** | 是（客户端当前路由上下文） | 是（服务端当前请求上下文） |
+| **忽略的错误** | HTTP 响应类型错误（`isResponse` 为 true，如 404） | 已中止的请求（`request.signal.aborted`） |
+
+### 3.3 进程退出错误捕获（特殊情况）
+
+| 维度 | 说明 |
+|------|------|
+| **配置位置** | `server/index.ts` 的 `closeWithGrace` |
+| **执行环境** | Node.js 服务端 |
+| **捕获时机** | 进程收到 `SIGTERM`/`SIGINT` 信号时 |
+| **捕获的错误** | 进程级别的错误（非请求相关） |
+| **是否关联请求** | ❌ 否（错误可能发生在请求上下文之外） |
+| **特殊处理** | 调用 `Sentry.flush(500)` 确保事件在进程退出前发送 |
+
+---
+
+## 四、显式配置 vs SDK 默认行为 对比总表
+
+### 4.1 客户端
 
 | 功能 | 仓库显式配置 | SDK 默认行为 | 状态 |
 |------|-------------|--------------|------|
@@ -299,6 +401,7 @@ export function init() {
 | 浏览器性能分析 | ✅ `browserProfilingIntegration()` | - | 显式 |
 | 扩展错误过滤 | ✅ `beforeSend` | - | 显式 |
 | 采样率配置 | ✅ `tracesSampleRate` | - | 显式 |
+| **路由错误捕获** | ✅ `error-boundary.tsx` 的 `useEffect` | - | 显式（客户端） |
 | React Router 追踪 | ❌ 无代码 | ✅ SDK 自动 | 默认 |
 | Fetch/XHR 追踪 | ❌ 无代码 | ✅ SDK 自动 | 默认 |
 | 自动错误边界 | ❌ 无代码 | ✅ SDK 自动 | 默认 |
@@ -306,7 +409,7 @@ export function init() {
 | 用户上下文 | ❌ 无代码 | ❌ | 缺失 |
 | 自定义 Span | ❌ 无代码 | ❌ | 缺失 |
 
-### 3.2 服务端
+### 4.2 服务端
 
 | 功能 | 仓库显式配置 | SDK 默认行为 | 状态 |
 |------|-------------|--------------|------|
@@ -317,8 +420,8 @@ export function init() {
 | URL 黑名单 | ✅ `denyUrls` | - | 显式 |
 | 动态采样 | ✅ `tracesSampler` | - | 显式 |
 | 事务过滤 | ✅ `beforeSendTransaction` | - | 显式 |
-| Loader/Action 错误捕获 | ✅ `entry.server.tsx:handleError` | - | 显式 |
-| 路由错误捕获 | ✅ `error-boundary.tsx` | - | 显式 |
+| **Loader/Action 错误捕获** | ✅ `entry.server.tsx:handleError` | - | 显式（服务端） |
+| **进程退出错误捕获** | ✅ `server/index.ts:closeWithGrace` | - | 显式（服务端） |
 | Release 配置 | ✅ `vite.config.ts` | - | 显式 |
 | Sourcemaps 上传 | ✅ `vite.config.ts` | - | 显式 |
 | Express 请求追踪 | ❌ 无代码 | ✅ SDK 自动 | 默认 |
@@ -327,7 +430,7 @@ export function init() {
 | 用户上下文 | ❌ 无代码 | ❌ | 缺失 |
 | 请求信息增强 | ❌ 无代码 | ❌ | 缺失 |
 
-### 3.3 边缘中间件
+### 4.3 边缘中间件
 
 | 功能 | 仓库显式配置 | SDK 默认行为 | 状态 |
 |------|-------------|--------------|------|
@@ -337,21 +440,22 @@ export function init() {
 
 ---
 
-## 四、同一次请求中错误关联的实际能力
+## 五、同一次请求中错误关联的实际能力
 
-### 4.1 理论关联模型（依赖 SDK 默认行为）
+### 5.1 理论关联模型（依赖 SDK 默认行为）
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │                    客户端 (Browser)                               │
 │                                                                  │
+│  显式配置:                                                        │
+│  - Sentry 初始化 (monitoring.client.tsx)                        │
+│  - GeneralErrorBoundary 的 useEffect 中捕获路由错误              │
+│                                                                  │
 │  SDK 默认行为:                                                    │
 │  1. 从 HTML <meta name="sentry-trace"> 读取 Trace ID           │
 │  2. 自动在 Fetch/XHR 中添加 sentry-trace 头                      │
-│  3. 自动捕获路由错误和全局错误                                     │
-│                                                                  │
-│  显式配置:                                                        │
-│  - GeneralErrorBoundary 调用 captureException()                 │
+│  3. 自动捕获全局错误 (window.onerror)                            │
 └─────────────────────────────────────────────────────────────────┘
                               │
                               │ SDK 默认行为:
@@ -360,20 +464,21 @@ export function init() {
 ┌─────────────────────────────────────────────────────────────────┐
 │                    服务端 (Node.js)                               │
 │                                                                  │
+│  显式配置:                                                        │
+│  - Sentry 初始化 (server/utils/monitoring.ts)                    │
+│  - prismaIntegration: 追踪数据库查询                              │
+│  - httpIntegration: 追踪 HTTP 调用                                │
+│  - handleError: Loader/Action 错误捕获                           │
+│  - closeWithGrace: 进程退出错误捕获                               │
+│                                                                  │
 │  SDK 默认行为:                                                    │
 │  1. 从请求头读取 sentry-trace 和 baggage                         │
 │  2. 自动创建 HTTP 事务，关联到同一 Trace                          │
 │  3. 使用 AsyncLocalStorage 隔离请求上下文                        │
-│                                                                  │
-│  显式配置:                                                        │
-│  - prismaIntegration: 追踪数据库查询                              │
-│  - httpIntegration: 追踪 HTTP 调用                                │
-│  - handleError: Loader/Action 错误调用 captureException()       │
-│  - closeWithGrace: 进程退出错误捕获                               │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-### 4.2 实际可验证的关联点
+### 5.2 实际可验证的关联点
 
 #### 关联点 1：服务端内部操作
 
@@ -401,17 +506,31 @@ export function init() {
 
 **可验证** - 仓库显式配置了错误捕获：
 
-| 错误类型 | 捕获位置 | 是否关联 Trace |
-|----------|----------|----------------|
-| Loader/Action 错误 | `entry.server.tsx:handleError` | ✅ SDK 默认关联当前活动事务 |
-| 路由组件错误 | `error-boundary.tsx:captureException` | ✅ SDK 默认关联当前活动事务 |
-| 进程退出错误 | `server/index.ts:closeWithGrace` | ⚠️ 可能不关联（非请求上下文） |
+| 错误类型 | 捕获位置 | 执行环境 | 是否关联 Trace |
+|----------|----------|----------|----------------|
+| Loader/Action 错误 | `entry.server.tsx:handleError` | 服务端 | ✅ SDK 默认关联当前活动事务 |
+| 进程退出错误 | `server/index.ts:closeWithGrace` | 服务端 | ❌ 不关联（非请求上下文） |
 
 **证据**：
-- `Sentry.captureException(error)` 会自动关联当前 Scope 中的 Trace 上下文
+- `handleError` 显式调用 `Sentry.captureException(error)`
+- 这个函数在服务端请求上下文中执行，会自动关联当前 Trace
 - 但 `closeWithGrace` 中的错误可能在请求上下文之外，无法关联
 
-#### 关联点 3：客户端 → 服务端（依赖 SDK 默认行为）
+#### 关联点 3：客户端错误捕获
+
+**可验证** - 仓库显式配置了错误捕获：
+
+| 错误类型 | 捕获位置 | 执行环境 | 是否关联 Trace |
+|----------|----------|----------|----------------|
+| 客户端路由错误 | `error-boundary.tsx:useEffect` | 客户端 | ⚠️ 依赖 SDK 默认行为 |
+| 全局错误 | SDK 默认行为 | 客户端 | ⚠️ 依赖 SDK 默认行为 |
+
+**证据**：
+- `GeneralErrorBoundary` 显式在 `useEffect` 中调用 `captureException(error)`
+- `useEffect` 只在客户端执行
+- Trace 关联依赖 SDK 的默认行为（自动关联当前 Scope）
+
+#### 关联点 4：客户端 → 服务端 Trace 传播（依赖 SDK 默认行为）
 
 **理论可行，但无法在仓库中验证**：
 
@@ -432,7 +551,7 @@ SDK 默认行为: 自动添加请求头
 2. 依赖 `@sentry/react-router` SDK 的文档说明
 3. 需要实际运行测试才能确认
 
-#### 关联点 4：服务端 → 客户端（依赖 SDK 默认行为）
+#### 关联点 5：服务端 → 客户端 Trace 传播（依赖 SDK 默认行为）
 
 **理论可行，但无法在仓库中验证**：
 
@@ -453,7 +572,7 @@ SDK 默认行为: 注入 meta 标签
 2. `root.tsx` 的 `Document` 组件中没有相关代码
 3. 依赖 SDK 文档说明
 
-### 4.3 无法关联的场景
+### 5.3 无法关联的场景
 
 | 场景 | 无法关联的原因 | 证据 |
 |------|---------------|------|
@@ -463,14 +582,14 @@ SDK 默认行为: 注入 meta 标签
 | **边缘中间件 → 任何链路** | 根本没有边缘中间件 | 无 `middleware.ts` |
 | **按业务标签筛选错误** | 未调用 `Sentry.setTag()` | 仓库 grep 无 `setTag` |
 
-### 4.4 错误关联实际能力总结
+### 5.4 错误关联实际能力总结
 
 ```
 一次完整请求的错误关联能力：
 
 客户端 (Browser)
 ├── 路由错误
-│   └── ✅ 被 GeneralErrorBoundary 捕获
+│   └── ✅ 被 GeneralErrorBoundary 的 useEffect 捕获（显式配置）
 │   └── ⚠️ Trace 关联依赖 SDK 默认行为（无法验证）
 │
 ├── 全局错误 (window.onerror)
@@ -499,9 +618,39 @@ SDK 默认行为: 注入 meta 标签
 
 ---
 
-## 五、关键问题澄清
+## 六、关键问题澄清
 
-### 5.1 仓库中真的有分布式追踪吗？
+### 6.1 为什么有两套错误捕获机制？
+
+**答案：React Router 的设计**
+
+React Router v7 区分了：
+1. **服务端入口** (`entry.server.tsx`)：导出 `handleError` 处理 SSR 期间的错误
+2. **客户端入口** (`entry.client.tsx`)：可以导出 `handleError` 处理客户端错误（但 Epic Stack 没有）
+3. **路由错误边界**：每个路由可以导出 `ErrorBoundary` 组件，在客户端渲染时捕获错误
+
+Epic Stack 的选择：
+- ✅ 服务端：使用 `entry.server.tsx` 的 `handleError`
+- ✅ 客户端：使用 `GeneralErrorBoundary` 组件（在 `useEffect` 中捕获）
+- ❌ 客户端：没有在 `entry.client.tsx` 导出 `handleError`
+
+### 6.2 两套错误捕获会重复上报吗？
+
+**理论上不会，但实际取决于错误类型**：
+
+| 错误类型 | 服务端 handleError | 客户端 GeneralErrorBoundary |
+|----------|---------------------|-----------------------------|
+| SSR 期间 Loader 抛出错误 | ✅ 捕获 | ❌ 不捕获（useEffect 不执行） |
+| SSR 期间 Action 抛出错误 | ✅ 捕获 | ❌ 不捕获 |
+| 客户端导航时 Loader 错误 | ❌ 不捕获（服务端已处理完） | ✅ 捕获（useEffect 执行） |
+| 客户端组件渲染错误 | ❌ 不捕获 | ✅ 捕获 |
+
+**关键点**：
+- `GeneralErrorBoundary` 中的 `captureException` 在 `useEffect` 中
+- `useEffect` 只在客户端 Hydration 后执行
+- 服务端 SSR 时 `useEffect` 不执行，所以不会重复捕获
+
+### 6.3 仓库中真的有分布式追踪吗？
 
 **答案：部分有，部分依赖 SDK 默认行为**
 
@@ -509,11 +658,12 @@ SDK 默认行为: 注入 meta 标签
 |----------|------|------|
 | 服务端内部操作追踪 | ✅ 显式配置 | `prismaIntegration`, `httpIntegration` |
 | 服务端错误捕获 | ✅ 显式配置 | `handleError`, `captureException` |
+| 客户端错误捕获 | ✅ 显式配置 | `GeneralErrorBoundary` 的 `useEffect` |
 | 跨环境 Trace 传播 | ⚠️ 依赖 SDK 默认 | 无显式代码处理 `sentry-trace` 头 |
 | 用户上下文关联 | ❌ 缺失 | 无 `setUser` 调用 |
 | 自定义业务 Span | ❌ 缺失 | 无 `startSpan` 调用 |
 
-### 5.2 为什么报告中提到的某些功能无法验证？
+### 6.4 为什么报告中提到的某些功能无法验证？
 
 `@sentry/react-router` SDK 设计为"开箱即用"，许多功能是自动的：
 
@@ -526,24 +676,11 @@ SDK 默认行为: 注入 meta 标签
 - **依赖 SDK 版本和实现**
 - **升级 SDK 可能改变行为**
 
-### 5.3 当前配置能满足生产需求吗？
-
-**基本满足，但有明显短板**：
-
-| 需求 | 是否满足 | 说明 |
-|------|----------|------|
-| 错误上报 | ✅ 满足 | 显式配置了错误捕获 |
-| 性能监控 | ⚠️ 部分满足 | 依赖 SDK 默认行为 |
-| 分布式追踪 | ⚠️ 部分满足 | 跨环境关联依赖 SDK 默认 |
-| 用户追踪 | ❌ 不满足 | 未设置用户上下文 |
-| 业务标签 | ❌ 不满足 | 未设置自定义标签 |
-| 精细化追踪 | ❌ 不满足 | 无自定义 Span |
-
 ---
 
-## 六、改进建议
+## 七、改进建议
 
-### 6.1 高优先级改进
+### 7.1 高优先级改进
 
 #### 1. 添加用户上下文关联
 
@@ -553,12 +690,11 @@ export async function loader({ request }: Route.LoaderArgs) {
     const userId = await getUserId(request)
     const user = userId ? await prisma.user.findUnique({...}) : null
     
-    // 新增：设置用户上下文
+    // 新增：设置用户上下文（服务端和客户端都需要）
     if (user) {
         Sentry.setUser({
             id: user.id,
             username: user.username,
-            email: user.email,  // 如果有的话
         })
     }
     
@@ -566,10 +702,30 @@ export async function loader({ request }: Route.LoaderArgs) {
 }
 ```
 
-#### 2. 添加请求信息增强
+#### 2. 统一错误捕获策略
+
+考虑是否需要在 `entry.client.tsx` 也导出 `handleError`：
 
 ```typescript
-// 建议在 entry.server.tsx 或自定义中间件中
+// entry.client.tsx（可选改进）
+export function handleError(error: unknown, { request }: ...) {
+    // 客户端级别的错误处理
+    Sentry.captureException(error)
+}
+```
+
+**当前现状**：
+- 服务端：`entry.server.tsx` 有 `handleError`
+- 客户端：`entry.client.tsx` 没有 `handleError`，依赖 `GeneralErrorBoundary`
+
+**需要评估**：两套机制是否足够，还是需要统一
+
+### 7.2 中优先级改进
+
+#### 3. 添加请求信息增强
+
+```typescript
+// entry.server.tsx 中的 handleError
 export function handleError(error: unknown, { request }: ...) {
     // 新增：设置请求上下文
     Sentry.setContext('request', {
@@ -583,9 +739,7 @@ export function handleError(error: unknown, { request }: ...) {
 }
 ```
 
-### 6.2 中优先级改进
-
-#### 3. 添加自定义业务 Span
+#### 4. 添加自定义业务 Span
 
 ```typescript
 // 建议在关键业务操作中
@@ -607,16 +761,16 @@ export async function loader({ request }: Route.LoaderArgs) {
 }
 ```
 
-#### 4. 验证 SDK 默认行为
+#### 5. 验证 SDK 默认行为
 
 建议添加集成测试验证以下行为：
 - `sentry-trace` 头是否正确传递
 - HTML meta 标签是否正确注入
 - 跨环境 Trace ID 是否一致
 
-### 6.3 低优先级改进
+### 7.3 低优先级改进
 
-#### 5. 添加边缘中间件（如果需要）
+#### 6. 添加边缘中间件（如果需要）
 
 如果未来迁移到 Vercel 或需要边缘计算：
 - 创建 `middleware.ts`
@@ -625,26 +779,27 @@ export async function loader({ request }: Route.LoaderArgs) {
 
 ---
 
-## 七、附录：相关文件索引
+## 八、附录：相关文件索引
 
-### 7.1 仓库中实际存在的文件
+### 8.1 仓库中实际存在的文件
 
-| 文件路径 | 功能 | 配置类型 |
-|----------|------|----------|
-| `app/utils/monitoring.client.tsx` | 客户端 Sentry 初始化 | 显式配置 |
-| `server/utils/monitoring.ts` | 服务端 Sentry 初始化 | 显式配置 |
-| `app/entry.client.tsx` | 客户端入口，条件初始化 Sentry | 显式配置 |
-| `app/entry.server.tsx` | 服务端入口，handleError 错误捕获 | 显式配置 |
-| `server/index.ts` | Express 服务启动，进程退出错误捕获 | 显式配置 |
-| `app/components/error-boundary.tsx` | React Router 错误边界，错误捕获 | 显式配置 |
-| `vite.config.ts` | Sentry Vite 插件配置 | 显式配置 |
-| `docs/monitoring.md` | 官方监控配置文档 | 文档 |
+| 文件路径 | 功能 | 执行环境 | 配置类型 |
+|----------|------|----------|----------|
+| `app/utils/monitoring.client.tsx` | 客户端 Sentry 初始化 | 客户端 | 显式配置 |
+| `app/components/error-boundary.tsx` | 客户端路由错误捕获（useEffect 中） | 客户端 | 显式配置 |
+| `server/utils/monitoring.ts` | 服务端 Sentry 初始化 | 服务端 | 显式配置 |
+| `app/entry.server.tsx` | 服务端 Loader/Action 错误捕获 | 服务端 | 显式配置 |
+| `server/index.ts` | 进程退出错误捕获 | 服务端 | 显式配置 |
+| `app/entry.client.tsx` | 客户端入口，条件初始化 Sentry | 客户端 | 显式配置 |
+| `vite.config.ts` | Sentry Vite 插件配置 | 构建时 | 显式配置 |
+| `docs/monitoring.md` | 官方监控配置文档 | 文档 | 文档 |
 
-### 7.2 仓库中不存在的文件/配置
+### 8.2 仓库中不存在的文件/配置
 
 | 缺失项 | 说明 |
 |--------|------|
 | `middleware.ts` | 边缘中间件文件（完全不存在） |
+| `entry.client.tsx:handleError` | 客户端入口的错误处理函数（没有导出） |
 | `Sentry.setUser()` 调用 | 用户上下文设置 |
 | `Sentry.setTag()` 调用 | 自定义标签 |
 | `Sentry.setContext()` 调用（除了错误处理） | 自定义上下文 |
@@ -654,17 +809,20 @@ export async function loader({ request }: Route.LoaderArgs) {
 
 ---
 
-## 八、总结
+## 九、总结
 
-### 8.1 核心发现
+### 9.1 核心发现
 
 1. **客户端**：
    - ✅ 显式配置了 Sentry 初始化、Replay、性能分析
+   - ✅ 显式配置了 `GeneralErrorBoundary` 的 `useEffect` 错误捕获
    - ⚠️ 跨环境 Trace 传播依赖 SDK 默认行为
    - ❌ 缺少用户上下文、自定义 Span
 
 2. **服务端**：
-   - ✅ 显式配置了 Sentry 初始化、Prisma/HTTP 集成、错误捕获
+   - ✅ 显式配置了 Sentry 初始化、Prisma/HTTP 集成
+   - ✅ 显式配置了 `entry.server.tsx:handleError` 错误捕获
+   - ✅ 显式配置了 `closeWithGrace` 进程退出错误捕获
    - ✅ 显式配置了 Release 和 Sourcemaps
    - ⚠️ 跨环境 Trace 传播依赖 SDK 默认行为
    - ❌ 缺少用户上下文、请求信息增强
@@ -672,23 +830,33 @@ export async function loader({ request }: Route.LoaderArgs) {
 3. **边缘中间件**：
    - ❌ **完全不存在**，仓库使用 Express + Node.js 架构
 
-### 8.2 错误关联实际能力
+### 9.2 错误捕获边界澄清
+
+| 捕获机制 | 配置位置 | 执行环境 | 关键特征 |
+|----------|----------|----------|----------|
+| 客户端路由错误捕获 | `error-boundary.tsx` | 客户端 | 在 `useEffect` 中调用 |
+| 服务端 Loader/Action 错误 | `entry.server.tsx:handleError` | 服务端 | 作为 React Router 入口导出 |
+| 进程退出错误 | `server/index.ts:closeWithGrace` | 服务端 | 非请求上下文，不关联 Trace |
+
+### 9.3 错误关联实际能力
 
 | 关联类型 | 实际状态 |
 |----------|----------|
 | 服务端内部操作关联 | ✅ 显式配置可验证 |
 | 服务端错误 → Trace | ⚠️ 依赖 SDK 默认行为 |
+| 客户端错误 → Trace | ⚠️ 依赖 SDK 默认行为 |
 | 客户端 → 服务端 Trace 传播 | ⚠️ 依赖 SDK 默认行为 |
 | 服务端 → 客户端 Trace 传播 | ⚠️ 依赖 SDK 默认行为 |
 | 错误 → 具体用户 | ❌ 缺失 |
 | 边缘中间件参与链路 | ❌ 不存在 |
 
-### 8.3 关键建议
+### 9.4 关键建议
 
 1. **验证 SDK 默认行为**：不要假设 SDK 会做什么，通过集成测试确认
 2. **添加用户上下文**：这是错误分析中最有价值的信息之一
-3. **添加自定义 Span**：精细化追踪关键业务操作
-4. **考虑边缘中间件需求**：如果不需要边缘计算，当前架构已足够
+3. **统一错误捕获策略**：评估是否需要在 `entry.client.tsx` 也添加 `handleError`
+4. **添加自定义 Span**：精细化追踪关键业务操作
+5. **考虑边缘中间件需求**：如果不需要边缘计算，当前架构已足够
 
 ---
 
