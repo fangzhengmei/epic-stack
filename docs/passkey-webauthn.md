@@ -638,7 +638,7 @@ export async function action({ request }: Route.ActionArgs) {
 | 特性 | 实现方式 |
 |------|----------|
 | 列出所有密钥 | `prisma.passkey.findMany({ where: { userId } })` |
-| 显示设备类型 | `deviceType: 'platform' | 'cross-platform'` |
+| 显示设备类型 | 见下方「设备类型口径澄清」 |
 | 显示注册时间 | `formatDistanceToNow(createdAt)` |
 | 防止重复注册 | `excludeCredentials` + 数据库唯一约束 |
 | 安全删除 | `where: { id, userId }` 双重验证 |
@@ -836,9 +836,95 @@ model Passkey {
 
 ---
 
-## 10. 参考文档
+## 10. 发现的问题与建议
+
+### 10.1 前端设备类型显示 Bug
+
+**问题描述**:
+- 数据库 `deviceType` 存储的是 `'singleDevice'` | `'multiDevice'`
+- 前端代码判断 `passkey.deviceType === 'platform'`
+- 条件永不满足，导致所有密钥都显示为 "Security Key"
+
+**相关代码**:
+```tsx
+// passkeys.tsx:158-161
+{passkey.deviceType === 'platform'
+    ? 'Device'
+    : 'Security Key'}
+```
+
+**建议修复方案**:
+
+方案 A: 存储 `authenticatorAttachment` 字段
+- 在注册时从 `data.authenticatorAttachment` 获取
+- 存储到数据库新增字段（如 `attachment` 或 `authenticatorType`）
+- 前端使用新字段判断
+
+方案 B: 基于现有字段显示更准确的信息
+- `'multiDevice'` + `backedUp: true` → 显示 "Synced Passkey"
+- `'singleDevice'` → 显示 "Device Passkey"
+- 或者简化为统一显示 "Passkey"
+
+### 10.2 注册失败时 Cookie 未清理
+
+**问题描述**:
+- 注册流程 `registration.ts` 的 catch 块未设置删除 cookie 的 header
+- 认证流程 `authentication.ts` 在失败时会清理
+- 两者行为不一致
+
+**相关代码对比**:
+```typescript
+// registration.ts (未清理)
+} catch (error) {
+    return Response.json(
+        { status: 'error', error: getErrorMessage(error) },
+        { status: 400 },
+        // 缺少 Set-Cookie 删除 webauthn-challenge
+    )
+}
+
+// authentication.ts (已清理)
+} catch (error) {
+    return Response.json(
+        { status: 'error', error: ... },
+        { status: 400, headers: { 'Set-Cookie': deletePasskeyCookie } }
+    )
+}
+```
+
+**风险评估**:
+- 低风险：挑战本身是一次性的，且有 2 小时过期
+- 不一致：成功/失败、注册/认证流程行为不统一
+
+**建议修复**:
+在 `registration.ts` 的 catch 块中添加：
+```typescript
+return Response.json(
+    { status: 'error', error: getErrorMessage(error) } as const,
+    { 
+        status: 400,
+        headers: {
+            'Set-Cookie': await passkeyCookie.serialize('', { maxAge: 0 })
+        }
+    },
+)
+```
+
+### 10.3 术语混淆风险
+
+代码中存在两组易混淆的概念，文档已澄清，但建议代码中也添加注释或使用更清晰的变量名：
+
+| 概念 | 实际含义 | 建议命名 |
+|------|----------|----------|
+| `credentialDeviceType` | 凭证是否可同步 | `credentialSyncType` 或 `deviceSyncType` |
+| `authenticatorAttachment` | 认证器连接方式 | 已有清晰命名 |
+
+---
+
+## 11. 参考文档
 
 - 决策文档: `docs/decisions/039-passkeys.md`
 - 认证文档: `docs/authentication.md`
 - WebAuthn 标准: https://www.w3.org/TR/webauthn-2/
 - SimpleWebAuthn: https://simplewebauthn.dev/
+- SimpleWebAuthn Passkeys 文档: https://simplewebauthn.dev/docs/advanced/passkeys
