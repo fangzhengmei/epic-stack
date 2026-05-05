@@ -1461,6 +1461,1030 @@ export async function loader({ request }: Route.LoaderArgs) {
 
 ---
 
+## 8. 三大入口的 objectKey 暴露边界深度分析
+
+### 8.1 入口一：公开页面展示
+
+#### 暴露全景图
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    公开页面的 objectKey 暴露路径                          │
+└─────────────────────────────────────────────────────────────────────────┘
+
+                              任何人（未登录也可以）
+                                      │
+                    ┌─────────────────┼─────────────────┐
+                    ▼                 ▼                 ▼
+              ┌──────────┐     ┌──────────┐     ┌──────────┐
+              │ /users   │     │ /users/  │     │ /users/  │
+              │ (搜索)   │     │ $username│     │ $username │
+              │          │     │ (资料)   │     │ /notes   │
+              └────┬─────┘     └────┬─────┘     └────┬─────┘
+                   │                 │                 │
+                   ▼                 ▼                 ▼
+              ┌─────────────────────────────────────────────┐
+              │              暴露的 objectKey 类型            │
+              ├─────────────────────────────────────────────┤
+              │ 1. 所有用户的头像 imageObjectKey             │
+              │ 2. 指定用户的头像 image.objectKey            │
+              │ 3. 指定用户所有笔记的图片 objectKey           │
+              │ 4. 指定笔记的所有图片 objectKey               │
+              └─────────────────────────────────────────────┘
+```
+
+#### 具体暴露点分析
+
+**暴露点 1：用户搜索页面 `/users?search=...`**
+
+**文件**：[prisma/sql/searchUsers.sql](prisma/sql/searchUsers.sql:1-19)
+
+```sql
+SELECT 
+  "User".id,
+  "User".username,
+  "User".name,
+  "UserImage".id AS imageId,
+  "UserImage".objectKey AS imageObjectKey  -- ← 头像的 objectKey 被暴露
+FROM "User"
+LEFT JOIN "UserImage" ON "User".id = "UserImage".userId
+WHERE "User".username LIKE :like
+OR "User".name LIKE :like
+-- ...
+LIMIT 50
+```
+
+**暴露范围**：
+- 任何人都可以搜索用户名/姓名
+- 搜索结果包含匹配用户的 `imageObjectKey`
+- 最多返回 50 个用户的头像 key
+
+**前端使用**：
+**文件**：[app/routes/users/index.tsx](app/routes/users/index.tsx:50-56)
+
+```tsx
+<Img
+  alt={user.name ?? user.username}
+  src={getUserImgSrc(user.imageObjectKey)}  // ← 使用暴露的 objectKey
+  className="size-16 rounded-full"
+  width={256}
+  height={256}
+/>
+```
+
+---
+
+**暴露点 2：用户个人资料页面 `/users/$username`**
+
+**文件**：[app/routes/users/$username/index.tsx](app/routes/users/$username/index.tsx:18-35)
+
+```typescript
+export async function loader({ params }: LoaderFunctionArgs) {
+  const user = await prisma.user.findFirst({
+    select: {
+      id: true,
+      name: true,
+      username: true,
+      createdAt: true,
+      image: { select: { id: true, objectKey: true } },  // ← 暴露 image.objectKey
+    },
+    where: {
+      username: params.username,  // ← 只需知道用户名即可访问
+    },
+  })
+
+  invariantResponse(user, 'User not found', { status: 404 })
+  return { user, userJoinedDisplay: user.createdAt.toLocaleDateString() }
+}
+```
+
+**暴露范围**：
+- 任何人只需知道用户名即可访问
+- 返回该用户的头像 `objectKey`
+- 无任何权限检查
+
+---
+
+**暴露点 3：用户笔记列表页面 `/users/$username/notes`**
+
+**文件**：[app/routes/users/$username/notes/_layout.tsx](app/routes/users/$username/notes/_layout.tsx:11-26)
+
+```typescript
+export async function loader({ params }: Route.LoaderArgs) {
+  const owner = await prisma.user.findFirst({
+    select: {
+      id: true,
+      name: true,
+      username: true,
+      image: { select: { objectKey: true } },  // ← 头像
+      notes: { select: { id: true, title: true } },  // ← 所有笔记的 ID 和标题
+    },
+    where: { username: params.username },  // ← 只需知道用户名
+  })
+
+  invariantResponse(owner, 'Owner not found', { status: 404 })
+  return { owner }
+}
+```
+
+**暴露范围**：
+- 任何人只需知道用户名即可访问
+- 暴露该用户所有笔记的 `id`
+- 前端导航链接显示所有笔记标题
+
+---
+
+**暴露点 4：笔记详情页面 `/users/$username/notes/$noteId`**
+
+**文件**：[app/routes/users/$username/notes/$noteId.tsx](app/routes/users/$username/notes/$noteId.tsx:24-49)
+
+```typescript
+export async function loader({ params }: Route.LoaderArgs) {
+  // 直接查询笔记，不检查当前用户是否有权访问
+  const note = await prisma.note.findUnique({
+    where: { id: params.noteId },  // ← 只需知道笔记 ID
+    select: {
+      id: true,
+      title: true,
+      content: true,
+      ownerId: true,
+      updatedAt: true,
+      images: {
+        select: {
+          id: true,
+          altText: true,
+          objectKey: true,  // ← 笔记所有图片的 objectKey 都被暴露
+        },
+      },
+    },
+  })
+
+  invariantResponse(note, 'Not found', { status: 404 })
+  // 直接返回，不检查权限
+  return { note, timeAgo }
+}
+```
+
+**暴露范围**：
+- 任何人只需知道笔记 ID 即可访问
+- 返回笔记的标题、内容、所有图片的 `objectKey`
+- **无任何权限检查**
+
+**前端渲染**：
+**文件**：[app/routes/users/$username/notes/$noteId.tsx](app/routes/users/$username/notes/$noteId.tsx:126-138)
+
+```tsx
+{loaderData.note.images.map((image) => (
+  <li key={image.id}>
+    <a href={getNoteImgSrc(image.objectKey)}>  // ← 图片链接
+      <Img
+        src={getNoteImgSrc(image.objectKey)}  // ← 使用暴露的 objectKey
+        alt={image.altText ?? ''}
+        // ...
+      />
+    </a>
+  </li>
+))}
+```
+
+---
+
+#### 公开页面暴露总结表
+
+| 页面路由 | 访问条件 | 暴露的 objectKey 类型 | 权限检查 |
+|---------|---------|----------------------|---------|
+| `/users?search=...` | 知道搜索关键词 | 匹配用户的头像 key | ❌ 无 |
+| `/users/$username` | 知道用户名 | 指定用户的头像 key | ❌ 无 |
+| `/users/$username/notes` | 知道用户名 | 无（只暴露笔记 ID） | ❌ 无 |
+| `/users/$username/notes/$noteId` | 知道笔记 ID | 笔记所有图片的 key | ❌ 无 |
+
+**关键发现**：
+1. **头像**：所有用户的头像 objectKey 都是公开的（通过搜索或资料页面）
+2. **笔记图片**：任何人只要知道笔记 ID，就能获取该笔记所有图片的 objectKey
+3. **无任何权限检查**：这些页面都没有使用 `requireUserWithPermission` 或类似检查
+
+---
+
+### 8.2 入口二：登录后导出用户数据
+
+#### 权限边界分析
+
+**文件**：[app/routes/resources/download-user-data.tsx](app/routes/resources/download-user-data.tsx:1-62)
+
+```typescript
+export async function loader({ request }: Route.LoaderArgs) {
+  const userId = await requireUserId(request)  // ← 需要登录
+  
+  const user = await prisma.user.findUniqueOrThrow({
+    where: { id: userId },  // ← 只能获取当前登录用户的数据
+    include: {
+      image: {
+        select: {
+          id: true,
+          createdAt: true,
+          updatedAt: true,
+          objectKey: true,  // ← 自己的头像 key
+        },
+      },
+      notes: {
+        include: {
+          images: {
+            select: {
+              id: true,
+              createdAt: true,
+              updatedAt: true,
+              objectKey: true,  // ← 自己所有笔记的图片 key
+            },
+          },
+        },
+      },
+      password: false,  // 密码不返回
+      sessions: true,
+      roles: true,
+    },
+  })
+
+  const domain = getDomainUrl(request)
+
+  return Response.json({
+    user: {
+      ...user,
+      image: user.image
+        ? {
+            ...user.image,
+            url: domain + getUserImgSrc(user.image.objectKey),  // ← 完整 URL
+          }
+        : null,
+      notes: user.notes.map((note) => ({
+        ...note,
+        images: note.images.map((image) => ({
+          ...image,
+          url: domain + getNoteImgSrc(image.objectKey),  // ← 完整 URL
+        })),
+      })),
+    },
+  })
+}
+```
+
+#### 权限边界特征
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    导出用户数据的权限边界                                 │
+└─────────────────────────────────────────────────────────────────────────┘
+
+  访问条件：必须登录（requireUserId）
+       │
+       ▼
+  数据范围：只能获取当前登录用户的数据
+       │
+       ▼
+  暴露内容：
+  ├─ 自己的头像：objectKey + 完整 URL
+  ├─ 自己的所有笔记：
+  │   └─ 笔记的所有图片：objectKey + 完整 URL
+  ├─ 自己的会话信息
+  └─ 自己的角色权限信息
+
+  边界特征：
+  ✅ 有认证检查（requireUserId）
+  ✅ 数据隔离（只能访问自己的数据）
+  ❌ 但导出的数据包含完整的图片 URL，可被用于直接访问
+```
+
+#### 安全考量
+
+**导出的数据包含完整 URL**：
+```json
+{
+  "user": {
+    "image": {
+      "objectKey": "users/xxx/profile-images/123-abc.jpg",
+      "url": "https://app.com/resources/images?objectKey=users%2Fxxx%2F..."
+    },
+    "notes": [
+      {
+        "images": [
+          {
+            "objectKey": "users/xxx/notes/yyy/images/456-def.png",
+            "url": "https://app.com/resources/images?objectKey=users%2Fxxx%2F..."
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+**潜在风险**：
+1. 如果用户导出的数据被泄露，攻击者获得所有图片的完整 URL
+2. 这些 URL 可以直接用于访问资源（因为资源代理无权限检查）
+3. 即使后续实现了权限控制，这些已导出的 URL 仍然有效（直到 URL 改变）
+
+---
+
+### 8.3 入口三：资源代理 `/resources/images`
+
+#### 访问控制现状
+
+**文件**：[app/routes/resources/images.tsx](app/routes/resources/images.tsx:28-80)
+
+```typescript
+export async function loader({ request }: Route.LoaderArgs) {
+  const url = new URL(request.url)
+  const searchParams = url.searchParams
+
+  const headers = new Headers()
+  headers.set('Cache-Control', 'public, max-age=31536000, immutable')
+
+  const objectKey = searchParams.get('objectKey')
+
+  return getImgResponse(request, {
+    headers,
+    allowlistedOrigins: [
+      getDomainUrl(request),
+      process.env.AWS_ENDPOINT_URL_S3,
+    ].filter(Boolean),
+    cacheFolder: await getCacheDir(),
+    getImgSource: () => {
+      if (objectKey) {
+        // ⚠️ 关键：没有任何权限检查！
+        // 直接为 objectKey 生成签名请求
+        const { url: signedUrl, headers: signedHeaders } =
+          getSignedGetRequestInfo(objectKey)
+        return {
+          type: 'fetch',
+          url: signedUrl,
+          headers: signedHeaders,
+        }
+      }
+      // ... 其他来源
+    },
+  })
+}
+```
+
+#### 访问特征全景图
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    资源代理的访问特征                                     │
+└─────────────────────────────────────────────────────────────────────────┘
+
+  访问条件：只需知道 objectKey 的值
+       │
+       ▼
+  谁能访问：
+  ├─ 已登录用户 ✅
+  ├─ 未登录用户 ✅ （任何人）
+  └─ 甚至非浏览器的 HTTP 客户端 ✅
+
+  访问方式：
+  GET /resources/images?objectKey=users%2Fxxx%2Fprofile-images%2F123.jpg
+
+  权限检查：
+  ❌ 无 requireUserId
+  ❌ 无 requireUserWithPermission
+  ❌ 无任何基于 objectKey 的权限验证
+  ❌ 无路径格式验证（可尝试访问任意路径）
+
+  返回内容：
+  ✅ 图片二进制数据
+  ✅ Cache-Control: public, max-age=31536000, immutable
+  ✅ 允许 CDN 和中间代理缓存
+```
+
+#### 关键问题：objectKey 的可预测性
+
+**路径结构回顾**：
+```
+users/{userId}/profile-images/{timestamp}-{fileId}.{ext}
+users/{userId}/notes/{noteId}/images/{timestamp}-{fileId}.{ext}
+```
+
+**可预测性分析**：
+
+| 路径部分 | 是否可预测 | 说明 |
+|---------|-----------|------|
+| `users/` | ✅ 固定 | 所有用户资源都以此开头 |
+| `{userId}` | ⚠️ 部分可预测 | CUID 有规律，但难猜测 |
+| `profile-images/` | ✅ 固定 | 头像固定路径 |
+| `notes/` | ✅ 固定 | 笔记固定路径 |
+| `{noteId}` | ⚠️ 部分可预测 | CUID，可通过笔记列表获取 |
+| `images/` | ✅ 固定 | 图片固定路径 |
+| `{timestamp}` | ⚠️ 可估算 | 上传时间戳，可估算范围 |
+| `{fileId}` | ❌ 难预测 | CUID，随机 |
+| `{ext}` | ✅ 可预测 | jpg/png/gif 等常见格式 |
+
+**实际风险**：
+虽然 `fileId` 是随机 CUID 难以猜测，但：
+1. **objectKey 可通过公开页面获取**（如笔记详情页面直接返回）
+2. **用户搜索页面暴露头像 key**
+3. **导出功能导出所有 key**
+4. **笔记 ID 可通过笔记列表获取**
+
+所以问题不是"能否猜测 objectKey"，而是"获取 objectKey 后能否访问"。
+
+**答案是：任何人都能访问**。
+
+---
+
+## 9. 三大入口的闭环分析：谁能拿到链接、谁能直接访问
+
+### 9.1 完整链路闭环图
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│              objectKey 暴露 → 访问 的完整闭环                            │
+└─────────────────────────────────────────────────────────────────────────┘
+
+                    ┌─────────────────────────────┐
+                    │      阶段 1：获取链接        │
+                    │   谁能拿到 objectKey？       │
+                    └─────────────────────────────┘
+                                    │
+            ┌───────────────────────┼───────────────────────┐
+            ▼                       ▼                       ▼
+    ┌───────────────┐     ┌───────────────┐     ┌───────────────┐
+    │  公开页面     │     │  导出功能     │     │  其他途径     │
+    │  (未登录也可) │     │  (需登录)     │     │  (如日志泄露)  │
+    └───────┬───────┘     └───────┬───────┘     └───────┬───────┘
+            │                       │                       │
+            ▼                       ▼                       ▼
+    ┌─────────────────────────────────────────────────────────────────┐
+    │                    可获取的 objectKey 类型                        │
+    ├─────────────────────────────────────────────────────────────────┤
+    │ 公开页面：                                                      │
+    │   • 任意用户的头像（通过搜索或资料页面）                          │
+    │   • 任意笔记的所有图片（通过笔记详情页面）                         │
+    │                                                                 │
+    │ 导出功能：                                                      │
+    │   • 自己的头像                                                 │
+    │   • 自己所有笔记的所有图片                                       │
+    │                                                                 │
+    │ 其他途径：                                                      │
+    │   • 服务器日志                                                 │
+    │   • 数据库备份                                                 │
+    │   • API 响应泄露                                               │
+    └─────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+                    ┌─────────────────────────────┐
+                    │      阶段 2：直接访问        │
+                    │   拿到链接后能否访问资源？    │
+                    └─────────────────────────────┘
+                                    │
+                                    ▼
+                    ┌─────────────────────────────┐
+                    │   资源代理 /resources/images │
+                    │   权限检查：❌ 无任何检查    │
+                    │   缓存策略：public, immutable │
+                    └─────────────────────────────┘
+                                    │
+            ┌───────────────────────┼───────────────────────┐
+            ▼                       ▼                       ▼
+    ┌───────────────┐     ┌───────────────┐     ┌───────────────┐
+    │  已登录用户    │     │  未登录用户    │     │  恶意攻击者    │
+    │               │     │               │     │               │
+    │   ✅ 可访问    │     │   ✅ 可访问    │     │   ✅ 可访问    │
+    │               │     │               │     │               │
+    │  此外：       │     │  此外：       │     │  此外：       │
+    │  可分享给他人  │     │  可分享给他人  │     │  可批量访问    │
+    │  URL 可缓存   │     │  URL 可缓存   │     │  URL 可缓存   │
+    └───────────────┘     └───────────────┘     └───────────────┘
+                                    │
+                                    ▼
+                    ┌─────────────────────────────┐
+                    │      阶段 3：持久影响        │
+                    │   访问后会发生什么？         │
+                    └─────────────────────────────┘
+                                    │
+                                    ▼
+    ┌─────────────────────────────────────────────────────────────────┐
+    │  1. 浏览器缓存：Cache-Control: public, max-age=31536000, immutable │
+    │     • 缓存有效期 1 年                                            │
+    │     • immutable 意味着不会验证，直接使用缓存                       │
+    │     • 即使后续添加了权限控制，已缓存的副本仍然可用                 │
+    │                                                                 │
+    │  2. CDN/代理缓存：public 指令允许中间代理缓存                      │
+    │     • 任何 CDN 或反向代理都会缓存这些资源                          │
+    │     • 缓存可能存在于多个地理位置                                   │
+    │     • 难以完全清除                                                │
+    │                                                                 │
+    │  3. 服务端文件缓存：openimg 的本地缓存                             │
+    │     • 开发环境：./tests/fixtures/openimg                           │
+    │     • 生产环境：/data/images                                       │
+    │     • 基于 objectKey 的文件缓存                                    │
+    └─────────────────────────────────────────────────────────────────┘
+```
+
+### 9.2 典型场景分析
+
+#### 场景 1：普通用户访问其他用户的"私有"笔记图片
+
+```
+前提条件：
+• 用户 A 有一篇笔记，包含图片 P
+• 用户 B 不是用户 A 的好友/关注者
+• 假设系统设计上笔记应该是"私有的"
+
+实际情况：
+1. 用户 B 通过某种方式（如猜测、泄露、笔记列表）获得了笔记 ID
+2. 用户 B 访问 /users/A_username/notes/note_id
+   → 页面加载，返回笔记内容和图片的 objectKey
+3. 用户 B 的浏览器自动请求 /resources/images?objectKey=...
+   → 资源代理直接返回图片，无任何权限检查
+4. 图片被用户 B 的浏览器缓存 1 年
+
+结果：用户 B 成功访问了用户 A 的"私有"笔记图片
+```
+
+#### 场景 2：已删除/替换的图片仍然可访问
+
+```
+前提条件：
+• 用户上传了图片 P1，objectKey = key1
+• 用户替换图片为 P2，新 objectKey = key2
+• 数据库记录更新为 key2
+
+实际情况：
+1. 虽然数据库中已更新为 key2
+2. 但 key1 对应的 URL 仍然有效
+   → /resources/images?objectKey=key1 仍然返回 P1
+3. 任何知道 key1 的人都能继续访问
+4. Tigris 中的 P1 文件也没有被删除
+
+结果：已"删除"的图片实际上仍然可访问
+```
+
+#### 场景 3：URL 被分享后的持久访问
+
+```
+前提条件：
+• 用户分享了一个图片链接给朋友
+• 链接格式：https://app.com/resources/images?objectKey=...
+
+实际情况：
+1. 朋友将链接保存或转发给他人
+2. 即使原用户后来：
+   • 删除了图片
+   • 修改了笔记权限
+   • 甚至注销了账号
+3. 这个链接仍然有效（直到 objectKey 对应的文件被真正删除）
+4. 此外，任何访问过的人都有浏览器缓存
+
+结果：链接一旦分享，就失去了控制
+```
+
+### 9.3 权限矩阵
+
+| 资源类型 | 获取链接的条件 | 访问资源的条件 | 实际权限状态 |
+|---------|--------------|---------------|-------------|
+| **任意用户的头像** | 知道用户名或搜索关键词 | 无 | ❌ 完全公开 |
+| **任意笔记的图片** | 知道笔记 ID | 无 | ❌ 完全公开 |
+| **自己的头像** | 登录后可通过导出获取 | 无 | ⚠️ 可访问，但本来就是公开的 |
+| **自己笔记的图片** | 登录后可通过导出获取 | 无 | ⚠️ 可访问 |
+| **已删除笔记的图片** | 之前知道 objectKey | 无 | ❌ 仍然可访问 |
+| **已替换的旧图片** | 之前知道旧 objectKey | 无 | ❌ 仍然可访问 |
+
+---
+
+## 10. RBAC 系统与资产权限的衔接缺口分析
+
+### 10.1 RBAC 系统现状回顾
+
+#### RBAC 模型定义
+
+**文件**：[app/utils/user.ts](app/utils/user.ts:28-62)
+
+```typescript
+// 权限字符串格式
+type Action = 'create' | 'read' | 'update' | 'delete'
+type Entity = 'user' | 'note'                    // ← 注意：只有 user 和 note！
+type Access = 'own' | 'any'
+
+export type PermissionString =
+  | `${Action}:${Entity}`
+  | `${Action}:${Entity}:${Access}`
+
+// 解析后的权限结构
+function parsePermissionString(permissionString: PermissionString) {
+  const [action, entity, access] = permissionString.split(':')
+  return {
+    action,      // create | read | update | delete
+    entity,      // user | note
+    access: access ? (access.split(',') as Array<Access>) : undefined,
+  }
+}
+```
+
+#### RBAC 权限检查函数
+
+**文件**：[app/utils/permissions.server.ts](app/utils/permissions.server.ts:6-60)
+
+```typescript
+// 检查用户是否有特定权限
+export async function requireUserWithPermission(
+  request: Request,
+  permission: PermissionString,  // 如 'delete:note:own'
+) {
+  const userId = await requireUserId(request)
+  const permissionData = parsePermissionString(permission)
+  
+  const user = await prisma.user.findFirst({
+    select: { id: true },
+    where: {
+      id: userId,
+      roles: {
+        some: {
+          permissions: {
+            some: {
+              ...permissionData,
+              access: permissionData.access
+                ? { in: permissionData.access }
+                : undefined,
+            },
+          },
+        },
+      },
+    },
+  })
+  
+  if (!user) {
+    throw data({ error: 'Unauthorized' }, { status: 403 })
+  }
+  return user.id
+}
+
+// 检查用户是否有特定角色
+export async function requireUserWithRole(request: Request, name: string) {
+  const userId = await requireUserId(request)
+  const user = await prisma.user.findFirst({
+    select: { id: true },
+    where: { id: userId, roles: { some: { name } } },
+  })
+  // ...
+}
+```
+
+#### 前端权限检查
+
+**文件**：[app/utils/user.ts](app/utils/user.ts:48-70)
+
+```typescript
+// 前端检查用户是否有某权限（用于 UI 显示控制）
+export function userHasPermission(
+  user: Pick<ReturnType<typeof useUser>, 'roles'> | null | undefined,
+  permission: PermissionString,
+) {
+  if (!user) return false
+  const { action, entity, access } = parsePermissionString(permission)
+  return user.roles.some((role) =>
+    role.permissions.some(
+      (permission) =>
+        permission.entity === entity &&
+        permission.action === action &&
+        (!access || access.includes(permission.access)),
+    ),
+  )
+}
+```
+
+### 10.2 RBAC 系统的实际使用位置
+
+让我分析 RBAC 权限检查在代码中的实际使用情况：
+
+#### 使用位置 1：笔记删除操作
+
+**文件**：[app/routes/users/$username/notes/$noteId.tsx](app/routes/users/$username/notes/$noteId.tsx:56-90)
+
+```typescript
+export async function action({ request }: Route.ActionArgs) {
+  const userId = await requireUserId(request)
+  // ...
+  
+  const note = await prisma.note.findFirst({
+    select: { id: true, ownerId: true, owner: { select: { username: true } } },
+    where: { id: noteId },
+  })
+  invariantResponse(note, 'Not found', { status: 404 })
+
+  const isOwner = note.ownerId === userId
+  await requireUserWithPermission(
+    request,
+    isOwner ? `delete:note:own` : `delete:note:any`,  // ← 删除权限检查
+  )
+
+  await prisma.note.delete({ where: { id: note.id } })
+  // ...
+}
+```
+
+**前端 UI 控制**：
+**文件**：[app/routes/users/$username/notes/$noteId.tsx](app/routes/users/$username/notes/$noteId.tsx:92-103)
+
+```typescript
+export default function NoteRoute({ loaderData, actionData }: Route.ComponentProps) {
+  const user = useOptionalUser()
+  const isOwner = user?.id === loaderData.note.ownerId
+  const canDelete = userHasPermission(
+    user,
+    isOwner ? `delete:note:own` : `delete:note:any`,  // ← 前端检查删除权限
+  )
+  const displayBar = canDelete || isOwner
+  // ...
+}
+```
+
+#### 使用位置 2：管理员页面
+
+**文件**：[app/routes/admin/cache/index.tsx](app/routes/admin/cache/index.tsx:27)
+
+```typescript
+import { requireUserWithRole } from '#app/utils/permissions.server.ts'
+
+export async function loader({ request }: Route.LoaderArgs) {
+  const userId = await requireUserWithRole(request, 'admin')  // ← 需要 admin 角色
+  // ...
+}
+```
+
+#### 使用位置 3：安全文档中的示例
+
+**文件**：[docs/skills/epic-security/SKILL.md](docs/skills/epic-security/SKILL.md:62)
+
+```typescript
+// 3. Check permissions early - fail fast if unauthorized
+await requireUserWithPermission(request, 'create:note:own')
+```
+
+### 10.3 衔接缺口全景图
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    RBAC 系统与资产权限的衔接缺口                          │
+└─────────────────────────────────────────────────────────────────────────┘
+
+  ┌─────────────────────────────────────────────────────────────────────┐
+  │                        RBAC 系统能做什么                               │
+  ├─────────────────────────────────────────────────────────────────────┤
+  │                                                                       │
+  │  支持的 Entity（实体类型）：                                           │
+  │  ┌─────────────┐    ┌─────────────┐                                  │
+  │  │    user     │    │    note     │                                  │
+  │  │   (用户)    │    │   (笔记)    │                                  │
+  │  └─────────────┘    └─────────────┘                                  │
+  │                                                                       │
+  │  支持的 Action（操作）：                                              │
+  │  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐              │
+  │  │  create  │ │   read   │ │  update  │ │  delete  │              │
+  │  │  (创建)  │ │  (读取)  │ │  (更新)  │ │  (删除)  │              │
+  │  └──────────┘ └──────────┘ └──────────┘ └──────────┘              │
+  │                                                                       │
+  │  支持的 Access（范围）：                                              │
+  │  ┌─────────────┐    ┌─────────────┐                                  │
+  │  │    own      │    │    any      │                                  │
+  │  │  (自己的)   │    │  (任意的)   │                                  │
+  │  └─────────────┘    └─────────────┘                                  │
+  │                                                                       │
+  │  实际使用的权限检查：                                                  │
+  │  • 'delete:note:own'  - 删除自己的笔记                               │
+  │  • 'delete:note:any'  - 删除任意笔记（管理员）                        │
+  │  • 'create:note:own'  - 创建笔记（文档示例）                          │
+  │  • 'admin' 角色       - 访问管理页面                                  │
+  │                                                                       │
+  └─────────────────────────────────────────────────────────────────────┘
+
+                                    │
+                                    ▼ 缺口
+
+  ┌─────────────────────────────────────────────────────────────────────┐
+  │                      资产权限缺少什么                                 │
+  ├─────────────────────────────────────────────────────────────────────┤
+  │                                                                       │
+  │  缺失的 Entity（实体类型）：                                          │
+  │  ┌─────────────────┐    ┌─────────────────┐                         │
+  │  │    image/asset  │    │  user-image     │                         │
+  │  │   (图片/资产)   │    │  note-image     │                         │
+  │  └─────────────────┘    └─────────────────┘                         │
+  │                                                                       │
+  │  缺失的权限检查位置：                                                  │
+  │                                                                       │
+  │  1. 笔记读取权限 ❌                                                    │
+  │     └─ 笔记详情页面没有 'read:note' 权限检查                          │
+  │     └─ 任何人知道笔记 ID 就能读取笔记及其图片                         │
+  │                                                                       │
+  │  2. 图片读取权限 ❌                                                    │
+  │     └─ 资源代理 /resources/images 没有任何权限检查                    │
+  │     └─ 没有 'read:image' 或类似权限                                   │
+  │                                                                       │
+  │  3. 图片所有权验证 ❌                                                  │
+  │     └─ 没有检查请求者是否是图片/笔记的所有者                           │
+  │     └─ 没有利用 objectKey 中的 userId/noteId 信息                    │
+  │                                                                       │
+  │  4. 公开页面的权限 ❌                                                  │
+  │     └─ 用户搜索页面：没有检查是否允许搜索用户                          │
+  │     └─ 用户资料页面：没有检查是否允许查看该用户资料                    │
+  │     └─ 笔记列表页面：没有检查是否允许查看该用户笔记                    │
+  │                                                                       │
+  │  5. 导出功能的权限 ❌                                                  │
+  │     └─ 只有登录检查，没有更细粒度的权限控制                            │
+  │     └─ 导出的数据包含完整图片 URL                                     │
+  │                                                                       │
+  └─────────────────────────────────────────────────────────────────────┘
+```
+
+### 10.4 具体缺口分析
+
+#### 缺口 1：Entity 类型不完整
+
+| 现有 Entity | 缺失的 Entity | 影响 |
+|------------|--------------|------|
+| `user` | - | 可用于用户级权限 |
+| `note` | - | 可用于笔记级权限 |
+| - | `image` / `asset` | 无法直接检查图片权限 |
+| - | `user-image` | 无法检查头像权限 |
+| - | `note-image` | 无法检查笔记图片权限 |
+
+**问题**：如果想实现"只有笔记所有者才能读取笔记图片"，没有对应的 `read:note-image:own` 权限。
+
+#### 缺口 2：笔记读取缺少权限检查
+
+**当前状态**：
+```typescript
+// 笔记详情页面的 loader
+export async function loader({ params }: Route.LoaderArgs) {
+  // 直接查询，没有权限检查
+  const note = await prisma.note.findUnique({
+    where: { id: params.noteId },
+    // ...
+  })
+  
+  invariantResponse(note, 'Not found', { status: 404 })
+  return { note, timeAgo }  // 直接返回，无权限检查
+}
+```
+
+**应该有**：
+```typescript
+export async function loader({ params, request }: Route.LoaderArgs) {
+  const note = await prisma.note.findUnique({
+    where: { id: params.noteId },
+    select: { id: true, ownerId: true, /* visibility: true */ },
+  })
+  
+  invariantResponse(note, 'Not found', { status: 404 })
+  
+  // 应该有读取权限检查
+  const userId = await optionalUserId(request)
+  const isOwner = userId === note.ownerId
+  
+  // 检查笔记可见性或权限
+  // await requireUserWithPermission(
+  //   request,
+  //   isOwner ? 'read:note:own' : 'read:note:any'
+  // )
+  
+  // 或者检查笔记的 visibility 字段
+  // if (note.visibility === 'private' && !isOwner) {
+  //   throw new Response(null, { status: 403 })
+  // }
+  
+  return { note, timeAgo }
+}
+```
+
+#### 缺口 3：资源代理完全缺失权限检查
+
+**当前状态**：
+```typescript
+// 资源代理的 loader
+export async function loader({ request }: Route.LoaderArgs) {
+  const objectKey = searchParams.get('objectKey')
+  
+  // 没有任何权限检查
+  // 没有 requireUserId
+  // 没有 requireUserWithPermission
+  // 没有基于 objectKey 的所有权验证
+  
+  return getImgResponse(request, {
+    // ...
+    getImgSource: () => {
+      if (objectKey) {
+        const { url: signedUrl, headers: signedHeaders } =
+          getSignedGetRequestInfo(objectKey)  // 直接签名，无检查
+        return {
+          type: 'fetch',
+          url: signedUrl,
+          headers: signedHeaders,
+        }
+      }
+      // ...
+    },
+  })
+}
+```
+
+**应该有**：
+```typescript
+export async function loader({ request }: Route.LoaderArgs) {
+  const objectKey = searchParams.get('objectKey')
+  const currentUserId = await optionalUserId(request)
+  
+  // 解析 objectKey 路径
+  const parsed = parseObjectKey(objectKey)  // 提取 userId, noteId 等
+  
+  // 根据资源类型检查权限
+  switch (parsed.type) {
+    case 'profile-image':
+      // 头像：公开或检查权限
+      // 可以允许公开访问，也可以限制
+      break
+      
+    case 'note-image':
+      // 笔记图片：检查笔记权限
+      const note = await prisma.note.findUnique({
+        where: { id: parsed.noteId },
+        select: { ownerId: true, /* visibility: true */ },
+      })
+      
+      if (!note) {
+        throw new Response(null, { status: 404 })
+      }
+      
+      // 验证路径中的 ownerId 与数据库一致（防止路径欺骗）
+      if (note.ownerId !== parsed.ownerId) {
+        throw new Response(null, { status: 403 })
+      }
+      
+      // 检查权限
+      const isOwner = currentUserId === note.ownerId
+      // if (!isOwner && note.visibility === 'private') {
+      //   throw new Response(null, { status: 403 })
+      // }
+      // 或者使用 RBAC：
+      // if (!isOwner) {
+      //   await requireUserWithPermission(request, 'read:note:any')
+      // }
+      break
+      
+    default:
+      throw new Response(null, { status: 403 })
+  }
+  
+  // 权限检查通过后再获取图片
+  // ...
+}
+```
+
+#### 缺口 4：权限粒度与实际需求不匹配
+
+| 实际需求 | RBAC 现状 | 缺口 |
+|---------|----------|------|
+| 笔记可见性控制（公开/私有） | 无 `visibility` 字段 | 需扩展数据模型 |
+| 笔记图片继承笔记权限 | 无 `read:note-image` 权限 | 需扩展 Entity 类型 |
+| 头像可公开访问 | 无专门控制 | 需设计特殊规则 |
+| 资源级别的细粒度控制 | 只有 `own`/`any` 两级 | 需更多层次 |
+
+### 10.5 完整缺口汇总表
+
+| 检查位置 | 现有检查 | 缺失检查 | 风险等级 |
+|---------|---------|---------|---------|
+| **笔记创建** | ✅ `create:note:own` (文档) | - | 低 |
+| **笔记删除** | ✅ `delete:note:own/any` | - | 低 |
+| **笔记更新** | ⚠️ 隐含（通过 isOwner） | 无显式权限 | 中 |
+| **笔记读取** | ❌ 无 | `read:note:own/any` | **高** |
+| **笔记图片读取** | ❌ 无 | `read:note-image:own/any` | **高** |
+| **头像读取** | ❌ 无 | `read:user-image` | 中 |
+| **公开页面** | ❌ 无 | 可见性控制 | 中 |
+| **导出功能** | ⚠️ 仅 `requireUserId` | 更细粒度控制 | 中 |
+| **管理页面** | ✅ `admin` 角色 | - | 低 |
+
+### 10.6 关键发现总结
+
+1. **RBAC 系统设计完整，但未完全应用**
+   - 有 `read` action，但从未用于笔记读取
+   - 有 `user` 和 `note` entity，但没有 `image`/`asset` entity
+   - 权限检查主要用于**写入操作**（create, delete），**读取操作**几乎没有检查
+
+2. **写入有保护，读取完全开放**
+   - 删除笔记需要 `delete:note:own` 权限
+   - 但读取笔记（及其图片）不需要任何权限
+   - 这是典型的"重写轻读"安全模型，但不符合实际业务需求
+
+3. **objectKey 路径信息完全未被利用**
+   - 路径中包含 `userId` 和 `noteId`
+   - 但资源代理从未解析或验证这些信息
+   - 失去了基于路径做权限控制的机会
+
+4. **缓存策略加剧权限问题**
+   - `public, max-age=31536000, immutable`
+   - 即使后续添加了权限控制，已缓存的资源仍然可访问
+   - 这是一个"一旦泄露，永久可访问"的问题
+
+---
+
 ## 8. 鉴权方式设计分析
 
 #### 架构特点
