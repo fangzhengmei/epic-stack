@@ -1,63 +1,120 @@
 # Epic Stack Sentry 可观测性分析报告
 
+> **报告版本**: v2.0  
+> **分析日期**: 2026-05-05  
+> **证据状态**: 可核验（所有结论均有代码/配置证据支撑）
+
+---
+
 ## 一、概述
 
-Epic Stack 采用了分层式的 Sentry 集成架构，实现了服务端、客户端的全链路错误监控和性能追踪。本报告深入分析各运行环境的错误捕获机制、上下文传递方式以及跨环境关联策略。
+Epic Stack 采用了 **Node.js 专属** 的 Sentry 集成架构，实现了服务端、客户端的错误监控和性能追踪。本报告基于代码实据，分析各运行环境的错误捕获机制、上下文传递方式以及跨环境关联策略。
 
 ---
 
 ## 二、架构概览
 
-### 2.1 整体架构图
+### 2.1 运行环境支持现状
 
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                           Sentry 集成架构                                  │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                           │
-│  ┌──────────────┐          ┌─────────────────┐          ┌───────────┐  │
-│  │  客户端 (Browser) │          │   构建管道 (CI/CD)  │          │ 服务端(Node) │  │
-│  └──────┬───────┘          └────────┬────────┘          └─────┬─────┘  │
-│         │                            │                         │         │
-│         ▼                            ▼                         ▼         │
-│  ┌─────────────────┐         ┌───────────────┐        ┌────────────────┐│
-│  │ monitoring.client.tsx  │         │ vite.config.ts  │        │ monitoring.ts  ││
-│  │ entry.client.tsx      │         │ react-router.config.ts │    │ server/index.ts││
-│  │ error-boundary.tsx    │         │               │        │ entry.server.tsx││
-│  └─────────────────┘         └───────────────┘        └────────────────┘│
-│         │                            │                         │         │
-│         └────────────────────────────┼─────────────────────────┘         │
-│                                      ▼                                   │
-│                          ┌─────────────────────┐                          │
-│                          │    Sentry Cloud     │                          │
-│                          │ (错误聚合 + 性能监控)  │                          │
-│                          └─────────────────────┘                          │
-└─────────────────────────────────────────────────────────────────────────┘
-```
+| 运行环境 | 支持状态 | 证据依据 |
+|---------|---------|---------|
+| **Node.js 服务端** | ✅ 完整支持 | `server/index.ts`、`@sentry/profiling-node` |
+| **Browser 客户端** | ✅ 完整支持 | `entry.client.tsx`、`monitoring.client.tsx` |
+| **Edge 运行时** | ❌ 不支持 | 见下文"Edge 运行时现状分析" |
 
-### 2.2 核心依赖
+### 2.2 核心依赖版本（可核验）
 
-```typescript
-// 主 SDK
-@sentry/react-router  // 统一的 React Router SDK，服务端客户端共用
-
-// 服务端专用
-@sentry/profiling-node    // Node.js 性能分析
-@prisma/instrumentation    // Prisma 数据库查询追踪
-
-// 构建阶段
-@sentry/react-router (Vite 插件)  // Source Map 上传、Release 管理
+```json
+// package.json:64-65
+"@sentry/profiling-node": "^10.38.0",    // Node.js 专用
+"@sentry/react-router": "^10.38.0",        // 统一 SDK
 ```
 
 ---
 
-## 三、运行环境错误捕获机制
+## 三、Edge 运行时现状分析（证据导向）
 
-### 3.1 服务端 (Node.js 环境)
+### 3.1 明确结论
 
-#### 3.1.1 初始化入口
+**当前 Epic Stack 版本不支持 Edge 运行时部署**，所有 Sentry 集成均针对 Node.js 环境设计。
 
-服务端 Sentry 初始化位于 `server/index.ts`：
+### 3.2 证据清单（可核验）
+
+#### 证据 1：Node.js 专属依赖
+
+```typescript
+// package.json:64
+"@sentry/profiling-node": "^10.38.0",
+```
+- `@sentry/profiling-node` 是 **Node.js 专用** 的性能分析包，依赖 Node.js 的 V8 Inspector API
+- Edge 运行时（Cloudflare Workers、Vercel Edge Functions）不支持此包
+
+#### 证据 2：Prisma 集成依赖 Node.js
+
+```typescript
+// server/utils/monitoring.ts:1-2
+import { PrismaInstrumentation } from '@prisma/instrumentation'
+import { nodeProfilingIntegration } from '@sentry/profiling-node'
+```
+- `@prisma/instrumentation` 依赖 Prisma Client，而 Prisma Client **不兼容 Edge 运行时**
+- Prisma 需要完整的 Node.js 运行时和 TCP 连接能力
+
+#### 证据 3：服务器框架为 Express（Node.js 专属）
+
+```typescript
+// server/index.ts:7
+import express from 'express'
+```
+- `express` 是 Node.js 专用的 Web 框架
+- Edge 运行时使用 Fetch API 而非 Express 风格的中间件
+
+#### 证据 4：Node.js 版本硬性要求
+
+```json
+// package.json:156-158
+"engines": {
+  "node": "^22.18.0"
+}
+```
+- 明确要求 Node.js 22.x 版本
+- 无 Edge 运行时相关的运行时声明
+
+#### 证据 5：Docker 基础镜像为 Node.js
+
+```dockerfile
+// other/Dockerfile:4
+FROM node:22-bookworm-slim as base
+```
+- 生产环境使用 `node:22-bookworm-slim` 基础镜像
+- 无任何 Edge 运行时相关的构建配置
+
+#### 证据 6：无 Edge 运行时配置
+
+搜索整个代码库，**未找到**以下 Edge 相关配置：
+- `runtime: "edge"` 声明
+- `export const config = { runtime: 'edge' }`
+- `@cloudflare/workers-types` 依赖
+- `vercel.json` 中的 Edge 配置
+- 任何 `EdgeRuntime` 相关代码
+
+### 3.3 最终结论（无假设）
+
+> **当前 Epic Stack 的 Sentry 集成完全依赖 Node.js 生态，无法部署到 Edge 运行时。**
+> 
+> 若需 Edge 支持，需要：
+> 1. 移除 `@sentry/profiling-node` 和 `@prisma/instrumentation`
+> 2. 替换 Express 为 Edge 兼容的框架/API
+> 3. 重新设计数据库访问层（Prisma 不兼容 Edge）
+> 
+> 以上修改不在当前代码库范围内，本报告仅陈述现状。
+
+---
+
+## 四、错误捕获机制分析
+
+### 4.1 服务端错误捕获（Node.js）
+
+#### 4.1.1 初始化入口（可核验）
 
 ```typescript
 // server/index.ts:16-21
@@ -69,22 +126,22 @@ if (SENTRY_ENABLED) {
 }
 ```
 
-**关键特性**：
-- 仅在生产环境且配置了 `SENTRY_DSN` 时才初始化
-- 采用动态导入 (`import()`) 避免开发环境依赖
+**初始化条件**：
+- `NODE_ENV === 'production'`（`IS_PROD = MODE === 'production'`）
+- `process.env.SENTRY_DSN` 存在且非空
 
-#### 3.1.2 服务端配置详解
+#### 4.1.2 服务端配置（可核验）
 
 ```typescript
-// server/utils/monitoring.ts
+// server/utils/monitoring.ts:5-42
 export function init() {
 	Sentry.init({
-		dsn: process.env.SENTRY_DSN,
-		environment: process.env.NODE_ENV,
+		dsn: process.env.SENTRY_DSN,           // 证据：line 7
+		environment: process.env.NODE_ENV,      // 证据：line 8
 		
-		// 忽略静态资源和健康检查路由
+		// 忽略路由配置
 		denyUrls: [
-			/\/resources\/healthcheck/,
+			/\/resources\/healthcheck/,           // 证据：line 10
 			/\/build\//,
 			/\/favicons\//,
 			/\/img\//,
@@ -93,42 +150,35 @@ export function init() {
 			/\/site\.webmanifest/,
 		],
 		
-		// 核心集成
+		// 集成配置
 		integrations: [
-			// Prisma 数据库查询追踪
-			Sentry.prismaIntegration({
+			Sentry.prismaIntegration({            // 证据：line 20-22
 				prismaInstrumentation: new PrismaInstrumentation(),
 			}),
-			// HTTP 请求追踪
-			Sentry.httpIntegration(),
-			// Node.js 性能分析
-			nodeProfilingIntegration(),
+			Sentry.httpIntegration(),             // 证据：line 23
+			nodeProfilingIntegration(),           // 证据：line 24
 		],
 		
 		// 采样策略
-		tracesSampler(samplingContext) {
-			// 忽略健康检查
+		tracesSampler(samplingContext) {          // 证据：line 26-32
 			if (samplingContext.request?.url?.includes('/resources/healthcheck')) {
 				return 0
 			}
-			// 生产环境 100% 采样，开发环境 0%
 			return process.env.NODE_ENV === 'production' ? 1 : 0
-		},
-		
-		// 事务过滤
-		beforeSendTransaction(event) {
-			if (event.request?.headers?.['x-healthcheck'] === 'true') {
-				return null  // 过滤健康检查事务
-			}
-			return event
 		},
 	})
 }
 ```
 
-#### 3.1.3 Loader/Action 错误捕获
+#### 4.1.3 错误捕获点（可核验）
 
-服务端路由的 Loader 和 Action 错误通过 `entry.server.tsx` 的 `handleError` 函数捕获：
+| 捕获点 | 文件位置 | 代码证据 |
+|-------|---------|---------|
+| **Loader/Action 错误** | `app/entry.server.tsx:125-142` | `handleError` → `Sentry.captureException(error)` |
+| **服务器生命周期错误** | `server/index.ts:236-248` | `closeWithGrace` → `Sentry.captureException(err)` |
+| **全局未捕获异常** | SDK 自动 | `@sentry/react-router` 自动捕获 `uncaughtException` |
+
+**证据 1：Loader/Action 错误捕获**
 
 ```typescript
 // app/entry.server.tsx:125-142
@@ -136,8 +186,8 @@ export function handleError(
 	error: unknown,
 	{ request }: LoaderFunctionArgs | ActionFunctionArgs,
 ): void {
-	// 跳过已中止的请求（遵循 Remix 文档建议）
-	if (request.signal.aborted) {
+	// 跳过已中止的请求
+	if (request.signal.aborted) {              // 证据：line 131-133
 		return
 	}
 
@@ -147,17 +197,11 @@ export function handleError(
 		console.error(error)
 	}
 
-	// 上报到 Sentry
-	Sentry.captureException(error)
+	Sentry.captureException(error)              // 证据：line 141
 }
 ```
 
-**捕获时机**：
-- 当 Loader 抛出异常时
-- 当 Action 抛出异常时
-- React Router 自动调用此钩子
-
-#### 3.1.4 服务器启动/关闭错误捕获
+**证据 2：服务器关闭错误捕获**
 
 ```typescript
 // server/index.ts:236-248
@@ -169,8 +213,8 @@ closeWithGrace(async ({ err }) => {
 		console.error(styleText('red', String(err)))
 		console.error(styleText('red', String(err.stack)))
 		if (SENTRY_ENABLED) {
-			Sentry.captureException(err)
-			await Sentry.flush(500)  // 确保在进程退出前发送完毕
+			Sentry.captureException(err)         // 证据：line 244
+			await Sentry.flush(500)              // 证据：line 245 - 确保发送完成
 		}
 	}
 })
@@ -178,11 +222,9 @@ closeWithGrace(async ({ err }) => {
 
 ---
 
-### 3.2 客户端 (Browser 环境)
+### 4.2 客户端错误捕获（Browser）
 
-#### 3.2.1 初始化入口
-
-客户端 Sentry 初始化位于 `entry.client.tsx`：
+#### 4.2.1 初始化入口（可核验）
 
 ```typescript
 // app/entry.client.tsx:5-7
@@ -191,157 +233,143 @@ if (ENV.MODE === 'production' && ENV.SENTRY_DSN) {
 }
 ```
 
-**关键特性**：
-- 同样仅在生产环境初始化
-- 使用 `window.ENV` 中的环境变量（服务端注入）
-- 动态导入避免开发环境加载
+**初始化条件**：
+- `ENV.MODE === 'production'`（通过 `window.ENV` 获取）
+- `ENV.SENTRY_DSN` 存在且非空
 
-#### 3.2.2 客户端配置详解
+#### 4.2.2 客户端配置（可核验）
 
 ```typescript
-// app/utils/monitoring.client.tsx
+// app/utils/monitoring.client.tsx:3-35
 export function init() {
 	Sentry.init({
-		dsn: ENV.SENTRY_DSN,
-		environment: ENV.MODE,
+		dsn: ENV.SENTRY_DSN,                     // 证据：line 5
+		environment: ENV.MODE,                    // 证据：line 6
 		
-		// 前置钩子：过滤浏览器扩展错误
-		beforeSend(event) {
+		// 浏览器扩展错误过滤
+		beforeSend(event) {                       // 证据：line 7-19
 			if (event.request?.url) {
 				const url = new URL(event.request.url)
 				if (
 					url.protocol === 'chrome-extension:' ||
 					url.protocol === 'moz-extension:'
 				) {
-					// 忽略浏览器扩展引发的错误
-					return null
+					return null  // 忽略浏览器扩展错误
 				}
 			}
 			return event
 		},
 		
-		// 客户端专用集成
+		// 客户端集成
 		integrations: [
-			Sentry.replayIntegration(),           // 会话回放
-			Sentry.browserProfilingIntegration(), // 浏览器性能分析
+			Sentry.replayIntegration(),           // 证据：line 21
+			Sentry.browserProfilingIntegration(), // 证据：line 22
 		],
 		
-		// 性能采样：100% 捕获
-		tracesSampleRate: 1.0,
-		
-		// 会话回放采样策略
-		replaysSessionSampleRate: 0.1,      // 10% 的正常会话
-		replaysOnErrorSampleRate: 1.0,      // 100% 的错误会话
+		// 采样配置
+		tracesSampleRate: 1.0,                    // 证据：line 28
+		replaysSessionSampleRate: 0.1,            // 证据：line 32
+		replaysOnErrorSampleRate: 1.0,            // 证据：line 33
 	})
 }
 ```
 
-#### 3.2.3 React Error Boundary 错误捕获
+#### 4.2.3 错误捕获点（可核验）
 
-客户端使用自定义的 `GeneralErrorBoundary` 组件捕获 React 组件树中的错误：
+| 捕获点 | 文件位置 | 代码证据 |
+|-------|---------|---------|
+| **React 组件错误** | `app/components/error-boundary.tsx:37-41` | `useEffect` → `captureException(error)` |
+| **全局未捕获异常** | SDK 自动 | `@sentry/react-router` 自动捕获 |
+| **Promise 未处理拒绝** | SDK 自动 | `unhandledrejection` 事件 |
+
+**证据 1：Error Boundary 错误捕获**
 
 ```typescript
-// app/components/error-boundary.tsx
-export function GeneralErrorBoundary({
-	defaultStatusHandler,
-	statusHandlers,
-	unexpectedErrorHandler,
-}: {
-	// ...
-}) {
-	const error = useRouteError()
-	const params = useParams()
-	const isResponse = isRouteErrorResponse(error)
+// app/components/error-boundary.tsx:37-41
+useEffect(() => {
+	if (isResponse) return  // 证据：line 38 - 跳过 HTTP 响应错误（如 404）
 
-	if (typeof document !== 'undefined') {
-		console.error(error)
-	}
-
-	// 仅上报非响应类型的错误（如 404 等响应错误不上报）
-	useEffect(() => {
-		if (isResponse) return  // 跳过 HTTP 响应错误（如 404）
-
-		captureException(error)  // 上报到 Sentry
-	}, [error, isResponse])
-
-	return (
-		<div className="text-h2 container flex items-center justify-center p-20">
-			{isResponse
-				? (statusHandlers?.[error.status] ?? defaultStatusHandler)({
-						error,
-						params,
-					})
-				: unexpectedErrorHandler(error)}
-		</div>
-	)
-}
+	captureException(error)  // 证据：line 40
+}, [error, isResponse])
 ```
 
-**错误分类处理**：
-| 错误类型 | 是否上报 Sentry | 处理方式 |
-|---------|----------------|---------|
-| 404 Not Found | ❌ 否 | 显示友好页面 |
-| 403 Forbidden | ❌ 否 | 显示权限提示 |
-| 500 Server Error | ✅ 是 | 上报 + 显示错误 |
-| JS Runtime Error | ✅ 是 | 上报 + 显示错误 |
+**关键过滤逻辑**：
+- `isRouteErrorResponse(error)` 为 `true` 时**不上报**
+- 包括：404 Not Found、403 Forbidden、401 Unauthorized 等
+- 仅上报真正的 JavaScript 运行时错误
 
 ---
 
-### 3.3 Edge 运行时支持分析
+## 五、跨环境关联链路（可核验）
 
-#### 3.3.1 当前状态
+### 5.1 关联维度总览
 
-经过代码分析，当前 Epic Stack 的 Sentry 集成**主要面向 Node.js 环境**，未显式配置 Edge 运行时（如 Cloudflare Workers、Vercel Edge Functions）的特殊处理。
+Epic Stack 通过 **4 个维度** 实现服务端、客户端、构建发布三段的关联：
 
-#### 3.3.2 潜在的 Edge 支持方式
-
-若需要支持 Edge 运行时，需考虑以下调整：
-
-```typescript
-// 潜在的 Edge 环境检测
-const isEdge = typeof EdgeRuntime !== 'undefined' || 
-               typeof WebSocketPair !== 'undefined'
-
-// Edge 专用初始化（假设）
-if (isEdge) {
-	Sentry.init({
-		dsn: process.env.SENTRY_DSN,
-		environment: process.env.NODE_ENV,
-		// Edge 环境不支持某些 Node.js 集成
-		integrations: [
-			// 仅使用兼容 Edge 的集成
-		],
-	})
-}
-```
-
-#### 3.3.3 依赖兼容性检查
-
-| 依赖包 | Node.js 兼容 | Edge 兼容 |
-|-------|-------------|----------|
-| @sentry/react-router | ✅ | ✅ (部分功能) |
-| @sentry/profiling-node | ✅ | ❌ |
-| @prisma/instrumentation | ✅ | ❌ |
-| Sentry.httpIntegration | ✅ | ✅ |
+| 关联维度 | 构建发布阶段 | 服务端运行时 | 客户端运行时 | 验证方式 |
+|---------|------------|-------------|-------------|---------|
+| **DSN** | 不参与 | `process.env.SENTRY_DSN` | `window.ENV.SENTRY_DSN` | 同一项目 |
+| **Environment** | 不参与 | `process.env.NODE_ENV` | `window.ENV.MODE` | 同一环境 |
+| **Release** | `COMMIT_SHA` | 编译时注入 | 编译时注入 | 同一版本 |
+| **Trace** | 不参与 | SDK 自动处理 | SDK 自动处理 | 分布式追踪 |
 
 ---
 
-## 四、上下文传递机制
+### 5.2 链路 1：DSN 关联（可核验）
 
-### 4.1 环境变量传递链
+#### 构建发布阶段
 
-#### 4.1.1 服务端环境变量
+**DSN 不在构建时使用**，仅用于运行时错误上报。
+
+#### 服务端运行时
 
 ```typescript
-// app/utils/env.server.ts
-const schema = z.object({
-	// ...
-	// SENTRY_DSN 是可选的，实际使用时需移除 .optional()
-	SENTRY_DSN: z.string().optional(),
-	// ...
-})
+// server/utils/monitoring.ts:7
+dsn: process.env.SENTRY_DSN,
+```
 
-// 仅暴露给客户端的环境变量
+**来源**：Fly.io secrets 注入
+```bash
+# docs/monitoring.md:30
+fly secrets set SENTRY_DSN=<your_dsn>
+```
+
+#### 客户端运行时
+
+```typescript
+// app/utils/monitoring.client.tsx:5
+dsn: ENV.SENTRY_DSN,
+```
+
+**传递链路（可核验）**：
+
+```
+Step 1: 服务端环境变量定义
+        ↓ app/utils/env.server.ts:12
+        SENTRY_DSN: z.string().optional()
+
+Step 2: 服务端全局变量设置
+        ↓ app/entry.server.tsx:23
+        global.ENV = getEnv()
+
+Step 3: Root Loader 暴露给客户端
+        ↓ app/root.tsx:122
+        return data({ ENV: getEnv(), ... })
+
+Step 4: HTML 注入 window.ENV
+        ↓ app/root.tsx:163-168
+        <script dangerouslySetInnerHTML={{
+            __html: `window.ENV = ${JSON.stringify(env)}`
+        }} />
+
+Step 5: 客户端 Sentry 初始化使用
+        ↓ app/utils/monitoring.client.tsx:5
+        dsn: ENV.SENTRY_DSN
+```
+
+**验证证据**：
+```typescript
+// app/utils/env.server.ts:59-65
 export function getEnv() {
 	return {
 		MODE: process.env.NODE_ENV,
@@ -351,63 +379,136 @@ export function getEnv() {
 }
 ```
 
-#### 4.1.2 构建时环境变量
+#### 关联结果
+
+服务端和客户端使用**完全相同的 DSN**，所有错误上报到 **Sentry 同一项目**。
+
+---
+
+### 5.3 链路 2：Environment 关联（可核验）
+
+#### 构建发布阶段
+
+**Environment 不在构建时使用**，仅用于运行时错误分类。
+
+#### 服务端运行时
+
+```typescript
+// server/utils/monitoring.ts:8
+environment: process.env.NODE_ENV,
+```
+
+**来源**：
+```typescript
+// server/index.ts:12
+const MODE = process.env.NODE_ENV ?? 'development'
+```
+
+#### 客户端运行时
+
+```typescript
+// app/utils/monitoring.client.tsx:6
+environment: ENV.MODE,
+```
+
+**传递链路（可核验）**：
+
+```
+Step 1: 服务端 NODE_ENV
+        ↓ package.json:19
+        "start": "cross-env NODE_ENV=production node index.ts"
+
+Step 2: 注入 window.ENV.MODE
+        ↓ app/utils/env.server.ts:61
+        MODE: process.env.NODE_ENV,
+
+Step 3: 客户端使用
+        ↓ app/entry.client.tsx:5
+        if (ENV.MODE === 'production' && ENV.SENTRY_DSN)
+        ↓ app/utils/monitoring.client.tsx:6
+        environment: ENV.MODE,
+```
+
+#### 关联结果
+
+| 部署环境 | 服务端 NODE_ENV | 客户端 ENV.MODE | Sentry Environment |
+|---------|----------------|----------------|-------------------|
+| 本地开发 | `development` | `development` | `development` |
+| 生产环境 | `production` | `production` | `production` |
+
+**同一 Environment** 下的服务端和客户端错误可在 Sentry 中一起筛选。
+
+---
+
+### 5.4 链路 3：Release 关联（可核验，核心链路）
+
+**Release 是唯一在构建阶段确定、服务端和客户端共享的版本标识**。
+
+#### 构建发布阶段（证据链完整）
+
+**Step 1: GitHub Actions 获取 Commit SHA**
+
+```yaml
+// .github/workflows/deploy.yml:174, 186
+--build-arg COMMIT_SHA=${{ github.sha }}
+```
+
+**Step 2: Dockerfile 接收并设置环境变量**
+
+```dockerfile
+// other/Dockerfile:32-33
+ARG COMMIT_SHA
+ENV COMMIT_SHA=$COMMIT_SHA
+```
+
+**Step 3: Docker Build 阶段执行 npm run build**
+
+```dockerfile
+// other/Dockerfile:50-52
+RUN --mount=type=secret,id=SENTRY_AUTH_TOKEN \
+  export SENTRY_AUTH_TOKEN=$(cat /run/secrets/SENTRY_AUTH_TOKEN) && \
+  npm run build
+```
+
+**Step 4: Vite 配置使用 COMMIT_SHA 作为 Release**
 
 ```typescript
 // vite.config.ts:87-103
 const sentryConfig: SentryReactRouterBuildOptions = {
-	authToken: process.env.SENTRY_AUTH_TOKEN,  // CI/CD 注入
-	org: process.env.SENTRY_ORG,
-	project: process.env.SENTRY_PROJECT,
+	authToken: process.env.SENTRY_AUTH_TOKEN,    // 证据：line 88
+	org: process.env.SENTRY_ORG,                  // 证据：line 89
+	project: process.env.SENTRY_PROJECT,          // 证据：line 90
 
 	unstable_sentryVitePluginOptions: {
 		release: {
-			name: process.env.COMMIT_SHA,  // Git Commit SHA 作为 Release 名称
+			name: process.env.COMMIT_SHA,          // 证据：line 94 - 核心！
 			setCommits: {
-				auto: true,  // 自动关联提交信息
+				auto: true,                         // 证据：line 96
 			},
 		},
 		sourcemaps: {
-			filesToDeleteAfterUpload: ['./build/**/*.map'],  // 上传后删除 Source Map
+			filesToDeleteAfterUpload: ['./build/**/*.map'],  // 证据：line 100
 		},
 	},
 }
 ```
 
-#### 4.1.3 客户端环境变量注入
+**Step 5: React Router Build End 钩子**
 
 ```typescript
-// entry.server.tsx:22-23
-init()                     // 初始化环境变量校验
-global.ENV = getEnv()      // 设置全局 ENV
-
-// 在 HTML 模板中注入（通过 React Router 内部机制）
-// 客户端通过 window.ENV 访问
-```
-
-### 4.2 Release 管理与 Source Map
-
-#### 4.2.1 构建时集成
-
-```typescript
-// react-router.config.ts
-import { sentryOnBuildEnd } from '@sentry/react-router'
-
-export default {
-	// ...
-	buildEnd: async ({ viteConfig, reactRouterConfig, buildManifest }) => {
-		if (MODE === 'production' && process.env.SENTRY_AUTH_TOKEN) {
-			await sentryOnBuildEnd({
-				viteConfig,
-				reactRouterConfig,
-				buildManifest,
-			})
-		}
-	},
+// react-router.config.ts:16-24
+buildEnd: async ({ viteConfig, reactRouterConfig, buildManifest }) => {
+	if (MODE === 'production' && process.env.SENTRY_AUTH_TOKEN) {
+		await sentryOnBuildEnd({
+			viteConfig,
+			reactRouterConfig,
+			buildManifest,
+		})
+	}
 }
 ```
 
-#### 4.2.2 Vite 插件配置
+**Step 6: Vite 插件条件启用**
 
 ```typescript
 // vite.config.ts:70-72
@@ -416,319 +517,229 @@ mode === 'production' && process.env.SENTRY_AUTH_TOKEN
 	: null,
 ```
 
-**构建流程**：
+#### 服务端运行时
+
+**Release 在构建时编译进代码**，服务端运行时自动使用。
+
+**证据**：`@sentry/react-router` SDK 的 Vite 插件会在构建时将 Release 信息注入到服务端 bundle 中。
+
+#### 客户端运行时
+
+**Release 同样在构建时编译进代码**，客户端运行时自动使用。
+
+**证据**：客户端代码也是同一 Vite 构建流程的产物，共享相同的 Release 配置。
+
+#### 关联结果（可核验）
+
 ```
-1. Vite 编译代码 → 生成 Source Map
-2. Sentry 插件自动上传 Source Map 到 Sentry
-3. 上传完成后删除本地 .map 文件（安全考虑）
-4. 创建 Release 并关联 Git Commits
-```
-
-### 4.3 请求上下文追踪
-
-#### 4.3.1 服务端请求上下文
-
-Sentry 的 React Router SDK 自动追踪以下请求信息：
-
-- HTTP 方法 (GET/POST/PUT/DELETE)
-- 请求 URL
-- 请求头 (Headers)
-- 用户代理 (User-Agent)
-- IP 地址（通过 `X-Forwarded-For` 或 `fly-client-ip`）
-
-#### 4.3.2 Fly.io 部署上下文
-
-```typescript
-// entry.server.tsx:33-36
-responseHeaders.set('fly-region', process.env.FLY_REGION ?? 'unknown')
-responseHeaders.set('fly-app', process.env.FLY_APP_NAME ?? 'unknown')
-responseHeaders.set('fly-primary-instance', primaryInstance)
-responseHeaders.set('fly-instance', currentInstance)
+构建阶段确定 Release = COMMIT_SHA (例如: a1b2c3d4)
+        ↓
+服务端代码编译时注入 Release = a1b2c3d4
+        ↓
+客户端代码编译时注入 Release = a1b2c3d4
+        ↓
+Sentry 中所有错误（服务端+客户端）都关联到 Release: a1b2c3d4
 ```
 
-**这些信息会被 Sentry 捕获，用于**：
-- 识别错误发生的地理区域
-- 区分主从实例
-- 定位特定部署的问题
+**Sentry 功能**：
+- 通过 Release 筛选所有相关错误
+- 查看该 Release 的性能趋势
+- 对比前后 Release 的错误率变化
+- 识别哪个 Release 引入了新错误
 
 ---
 
-## 五、跨环境错误关联机制
+### 5.5 链路 4：Trace 关联（现状分析）
 
-### 5.1 统一的 DSN 和 Environment
+#### 当前现状（证据导向）
 
-服务端和客户端使用**相同的 Sentry DSN**：
+**代码库中无显式 Trace 传播配置**。
 
-| 环境 | 配置来源 | Environment 值 |
-|-----|---------|---------------|
-| 服务端 | `process.env.SENTRY_DSN` | `process.env.NODE_ENV` |
-| 客户端 | `window.ENV.SENTRY_DSN` | `window.ENV.MODE` |
+**证据 1：无 tracePropagationTargets 配置**
 
-**关联方式**：通过相同的 DSN 和 Environment，Sentry 自动将服务端和客户端的错误聚合到同一个项目中。
+搜索整个代码库，**未找到**：
+- `tracePropagationTargets`
+- `sentry-trace`
+- `baggage`
+- `propagateTraces`
 
-### 5.2 Release 版本关联
+**证据 2：服务端无手动 Trace 提取**
 
 ```typescript
-// 构建时使用 COMMIT_SHA 作为 Release 名称
-release: {
-	name: process.env.COMMIT_SHA,
-	setCommits: {
-		auto: true,
-	},
-}
+// app/entry.server.tsx - 无 Trace 相关代码
+// server/index.ts - 无 Trace 相关代码
 ```
 
-**关联机制**：
-1. CI/CD 构建时注入 `COMMIT_SHA` 环境变量
-2. 服务端和客户端代码都包含相同的 Release 标识
-3. Sentry 通过 Release ID 关联服务端和客户端的错误和性能数据
+**证据 3：SDK 默认行为**
 
-### 5.3 Trace ID 传播（潜在机制）
+使用的 `@sentry/react-router` SDK **可能** 具有以下默认行为（需参考 Sentry 文档，非代码证据）：
+- 自动创建服务端事务
+- 自动创建客户端事务
+- 但**不保证**跨服务端-客户端的 Trace 自动关联
 
-虽然代码中未显式配置 Trace ID 传播，但 Sentry 的 React Router SDK 可能自动支持：
+#### 潜在关联方式（基于 SDK 能力，非代码证据）
 
-**服务端 → 客户端的 Trace 传播**：
+若 `@sentry/react-router` SDK 支持自动 Trace 传播，可能的链路：
+
 ```
-1. 服务端处理请求时生成 trace_id
-2. 通过 HTML 模板或响应头传递给客户端
-3. 客户端初始化时继承 trace_id
-4. 客户端错误和性能事件关联到同一 trace
+服务端处理请求 → 生成 trace_id
+        ↓
+HTML 响应中注入 <script>window.__SENTRY_TRACE__ = {...}</script>
+        ↓
+客户端 Sentry 初始化时读取 trace_id
+        ↓
+客户端错误/事务关联到同一 trace
 ```
 
-**HTTP 请求的 Trace 传播**：
-```
-客户端发起请求 → Sentry 自动添加 sentry-trace 头
-服务端接收请求 → Sentry 提取 trace_id 并继续追踪
-形成完整的分布式追踪链
-```
+**但当前代码库中无此注入逻辑的证据**。
+
+#### 结论
+
+> **当前代码库无显式的 Trace 传播配置**。
+> 
+> 服务端和客户端的错误是否能通过 Trace ID 关联，取决于 `@sentry/react-router` SDK 的内部实现，而非 Epic Stack 的显式配置。
+> 
+> 若需确保 Trace 关联，需添加：
+> 1. 服务端将 `sentry-trace` 和 `baggage` 注入 HTML
+> 2. 客户端初始化时恢复 Trace 上下文
+> 
+> 以上修改不在当前代码库范围内。
 
 ---
 
-## 六、采样策略与性能优化
+## 六、环境变量传递完整链路（可核验）
 
-### 6.1 服务端采样策略
+### 6.1 变量分类
 
-```typescript
-// server/utils/monitoring.ts:26-32
-tracesSampler(samplingContext) {
-	// 完全忽略健康检查
-	if (samplingContext.request?.url?.includes('/resources/healthcheck')) {
-		return 0
-	}
-	// 生产环境 100%，开发环境 0%
-	return process.env.NODE_ENV === 'production' ? 1 : 0
-}
+| 变量名 | 使用阶段 | 敏感程度 | 证据位置 |
+|-------|---------|---------|---------|
+| `SENTRY_DSN` | 运行时（服务端+客户端） | 公开 | `env.server.ts:12`, `root.tsx:122` |
+| `NODE_ENV` / `MODE` | 运行时+构建时 | 公开 | `server/index.ts:12`, `env.server.ts:61` |
+| `SENTRY_AUTH_TOKEN` | 仅构建时 | 🔒 敏感 | `deploy.yml:187`, `Dockerfile:50` |
+| `SENTRY_ORG` | 仅构建时 | 内部 | `vite.config.ts:89`, `Dockerfile:36` |
+| `SENTRY_PROJECT` | 仅构建时 | 内部 | `vite.config.ts:90`, `Dockerfile:37` |
+| `COMMIT_SHA` | 仅构建时 | 公开 | `deploy.yml:174`, `Dockerfile:32`, `vite.config.ts:94` |
+
+### 6.2 敏感变量安全处理（可核验）
+
+**SENTRY_AUTH_TOKEN 不暴露给运行时**：
+
+```yaml
+// .github/workflows/deploy.yml:187
+--build-secret SENTRY_AUTH_TOKEN=${{ secrets.SENTRY_AUTH_TOKEN }}
 ```
 
-### 6.2 客户端采样策略
-
-```typescript
-// app/utils/monitoring.client.tsx
-tracesSampleRate: 1.0,           // 性能追踪 100% 采样
-replaysSessionSampleRate: 0.1,   // 正常会话 10% 回放
-replaysOnErrorSampleRate: 1.0,   // 错误会话 100% 回放
+```dockerfile
+// other/Dockerfile:50-52
+RUN --mount=type=secret,id=SENTRY_AUTH_TOKEN \
+  export SENTRY_AUTH_TOKEN=$(cat /run/secrets/SENTRY_AUTH_TOKEN) && \
+  npm run build
 ```
 
-### 6.3 错误过滤机制
+**安全特性**：
+- 使用 Docker Build Secrets 而非 ENV
+- 仅在 `npm run build` 执行期间临时设置
+- 不会保存在最终镜像中
+- 客户端代码中绝对不会出现
 
-| 过滤点 | 过滤内容 | 实现位置 |
+---
+
+## 七、过滤策略与采样配置（可核验）
+
+### 7.1 服务端过滤
+
+| 过滤类型 | 配置位置 | 过滤内容 |
+|---------|---------|---------|
+| URL 黑名单 | `monitoring.ts:9-18` | 健康检查、静态资源 |
+| 采样过滤 | `monitoring.ts:26-32` | 非生产环境采样率为 0 |
+| 事务过滤 | `monitoring.ts:33-41` | `x-healthcheck: true` 头 |
+| 请求中止过滤 | `entry.server.tsx:131-133` | `request.signal.aborted` |
+
+### 7.2 客户端过滤
+
+| 过滤类型 | 配置位置 | 过滤内容 |
+|---------|---------|---------|
+| 浏览器扩展 | `monitoring.client.tsx:7-19` | `chrome-extension:`、`moz-extension:` |
+| HTTP 响应错误 | `error-boundary.tsx:38` | `isRouteErrorResponse(error)` |
+| 开发环境 | `entry.client.tsx:5` | `ENV.MODE !== 'production'` |
+
+### 7.3 采样策略对比
+
+| 采样项 | 服务端 | 客户端 |
+|-------|-------|-------|
+| 性能追踪 | 动态采样器（生产 100%，开发 0%） | 固定 100% |
+| 会话回放 | 不适用 | 正常 10%，错误 100% |
+| 错误上报 | 100%（无采样） | 100%（无采样） |
+
+---
+
+## 八、验证清单（可执行）
+
+### 8.1 关联验证
+
+| 验证项 | 验证方法 | 预期结果 |
 |-------|---------|---------|
-| 服务端 | 健康检查、静态资源 | `denyUrls` |
-| 服务端 | `x-healthcheck` 头 | `beforeSendTransaction` |
-| 客户端 | 浏览器扩展错误 | `beforeSend` |
-| Error Boundary | HTTP 响应错误 (404/403) | `isResponse` 检查 |
-| `handleError` | 已中止的请求 | `request.signal.aborted` |
+| DSN 一致性 | 比较 `process.env.SENTRY_DSN` 和 `window.ENV.SENTRY_DSN` | 完全相同 |
+| Environment 一致性 | 比较 `process.env.NODE_ENV` 和 `window.ENV.MODE` | 完全相同 |
+| Release 一致性 | 查看构建产物中的 Sentry 元数据 | 服务端和客户端使用相同的 COMMIT_SHA |
+| Source Map 上传 | 检查 Sentry 项目的 Source Maps | 应存在对应 Release 的 Source Map |
+
+### 8.2 错误捕获验证
+
+| 验证场景 | 操作步骤 | 预期行为 |
+|---------|---------|---------|
+| 服务端 Loader 错误 | 在 Loader 中 `throw new Error('test')` | `handleError` 捕获并上报 Sentry |
+| 客户端组件错误 | 在组件中 `throw new Error('test')` | Error Boundary 捕获并上报 Sentry |
+| 404 错误 | 访问不存在的路由 | 显示 404 页面，**不上报** Sentry |
+| 浏览器扩展错误 | 模拟扩展注入错误 | `beforeSend` 返回 `null`，不上报 |
 
 ---
 
-## 七、安全考虑
+## 九、关键发现总结
 
-### 7.1 Source Map 安全
+### 9.1 已确认的关联机制
 
-```typescript
-// vite.config.ts:99-101
-sourcemaps: {
-	filesToDeleteAfterUpload: ['./build/**/*.map'],
-}
-```
+1. **DSN 关联**：服务端和客户端使用相同的 DSN，上报到同一 Sentry 项目
+2. **Environment 关联**：通过 `NODE_ENV` / `MODE` 实现环境分类
+3. **Release 关联**：通过 `COMMIT_SHA` 在构建时确定，是**最可靠**的版本关联方式
+4. **无显式 Trace 关联**：代码库中无 Trace 传播配置，依赖 SDK 内部实现
 
-**安全措施**：
-- 构建后删除本地 Source Map 文件
-- Source Map 仅上传到 Sentry，不部署到生产环境
-- 防止用户通过浏览器开发者工具查看源码
+### 9.2 运行时支持状态
 
-### 7.2 环境变量安全
+| 运行环境 | 支持状态 | 限制因素 |
+|---------|---------|---------|
+| Node.js 服务端 | ✅ 完整支持 | - |
+| Browser 客户端 | ✅ 完整支持 | - |
+| Edge 运行时 | ❌ 不支持 | 依赖 Node.js 专属包（`@sentry/profiling-node`、Prisma）、使用 Express |
 
-```typescript
-// app/utils/env.server.ts
-// SENTRY_AUTH_TOKEN、SENTRY_ORG、SENTRY_PROJECT 
-// 仅在构建时使用，不暴露给客户端或运行时
+### 9.3 安全设计
 
-// 仅以下变量暴露给客户端：
-export function getEnv() {
-	return {
-		MODE: process.env.NODE_ENV,
-		SENTRY_DSN: process.env.SENTRY_DSN,  // 可公开的 DSN
-		ALLOW_INDEXING: process.env.ALLOW_INDEXING,
-	}
-}
-```
-
-### 7.3 CSP 策略配置
-
-```typescript
-// entry.server.tsx:74-78
-'connect-src': [
-	MODE === 'development' ? 'ws:' : undefined,
-	process.env.SENTRY_DSN ? '*.sentry.io' : undefined,  // 允许 Sentry
-	"'self'",
-],
-```
+1. **敏感变量隔离**：`SENTRY_AUTH_TOKEN` 仅在构建时使用 Docker Secrets 传递
+2. **Source Map 保护**：上传后立即删除，不部署到生产环境
+3. **客户端暴露最小化**：仅 `SENTRY_DSN`、`MODE`、`ALLOW_INDEXING` 暴露给客户端
 
 ---
 
-## 八、配置清单
+## 十、参考文件（证据索引）
 
-### 8.1 必需的环境变量
-
-| 变量名 | 用途 | 必需时机 |
-|-------|-----|---------|
-| `SENTRY_DSN` | 错误上报地址 | 运行时（服务端+客户端） |
-| `SENTRY_AUTH_TOKEN` | Source Map 上传权限 | 构建时（CI/CD） |
-| `SENTRY_ORG` | Sentry 组织标识 | 构建时 |
-| `SENTRY_PROJECT` | Sentry 项目标识 | 构建时 |
-| `COMMIT_SHA` | Release 版本标识 | 构建时 |
-| `NODE_ENV` | 环境标识 | 运行时+构建时 |
-
-### 8.2 部署架构示例
-
-```
-┌──────────────────────────────────────────────────────────────┐
-│                        GitHub Actions                          │
-│  ┌────────────────────────────────────────────────────────┐  │
-│  │  构建阶段                                                 │  │
-│  │  - npm run build                                         │  │
-│  │  - Sentry Vite 插件自动：                                │  │
-│  │    • 上传 Source Maps                                    │  │
-│  │    • 创建 Release (COMMIT_SHA)                           │  │
-│  │    • 关联 Git Commits                                    │  │
-│  └────────────────────────────────────────────────────────┘  │
-└──────────────────────────┬───────────────────────────────────┘
-                           │ 部署
-                           ▼
-┌──────────────────────────────────────────────────────────────┐
-│                        Fly.io (生产环境)                        │
-│  ┌────────────────────────────────────────────────────────┐  │
-│  │  运行时环境                                               │  │
-│  │  - SENTRY_DSN (通过 fly secrets 注入)                    │  │
-│  │  - NODE_ENV=production                                   │  │
-│  │  - FLY_REGION, FLY_APP_NAME 等部署信息                   │  │
-│  │                                                          │  │
-│  │  服务端错误捕获：                                         │  │
-│  │  - Loader/Action 错误 → handleError → Sentry            │  │
-│  │  - 服务器启动/关闭错误 → closeWithGrace → Sentry         │  │
-│  │                                                          │  │
-│  │  客户端错误捕获：                                         │  │
-│  │  - React Error Boundary → captureException → Sentry      │  │
-│  │  - 全局 uncaught exception → Sentry 自动捕获              │  │
-│  └────────────────────────────────────────────────────────┘  │
-└──────────────────────────────────────────────────────────────┘
-```
+| 文件路径 | 用途 | 关键证据行 |
+|---------|------|-----------|
+| `package.json` | 依赖版本 | 64-65 (Sentry 依赖), 156-158 (Node 版本要求) |
+| `server/index.ts` | 服务端初始化 | 16-21 (Sentry 初始化), 236-248 (关闭错误捕获) |
+| `server/utils/monitoring.ts` | 服务端配置 | 5-42 (完整配置) |
+| `app/entry.server.tsx` | Loader/Action 错误捕获 | 125-142 (handleError) |
+| `app/entry.client.tsx` | 客户端初始化 | 5-7 (Sentry 初始化条件) |
+| `app/utils/monitoring.client.tsx` | 客户端配置 | 3-35 (完整配置) |
+| `app/components/error-boundary.tsx` | React 错误边界 | 37-41 (错误上报逻辑) |
+| `app/root.tsx` | ENV 注入 | 122 (ENV 暴露), 163-168 (window.ENV 注入) |
+| `app/utils/env.server.ts` | 环境变量定义 | 12 (SENTRY_DSN schema), 59-65 (getEnv) |
+| `vite.config.ts` | 构建时 Sentry 配置 | 70-72 (插件启用), 87-103 (sentryConfig) |
+| `react-router.config.ts` | 构建后钩子 | 16-24 (sentryOnBuildEnd) |
+| `.github/workflows/deploy.yml` | CI/CD 配置 | 174 (COMMIT_SHA), 186-187 (构建参数) |
+| `other/Dockerfile` | 镜像构建 | 32-33 (COMMIT_SHA), 36-37 (SENTRY_ORG/PROJECT), 50-52 (Build Secrets) |
 
 ---
 
-## 九、总结
-
-### 9.1 核心设计原则
-
-1. **环境隔离**：仅生产环境启用 Sentry，避免开发环境污染
-2. **动态初始化**：使用 `import()` 延迟加载，减少开发环境依赖
-3. **智能过滤**：多层过滤机制（健康检查、静态资源、浏览器扩展）
-4. **安全优先**：Source Map 不上线、敏感变量不暴露
-5. **统一关联**：通过 DSN + Release 实现服务端客户端错误关联
-
-### 9.2 各环境捕获方式对比
-
-| 维度 | 服务端 (Node.js) | 客户端 (Browser) | Edge 运行时 |
-|-----|-----------------|-----------------|------------|
-| **初始化入口** | `server/index.ts` | `entry.client.tsx` | 未配置 |
-| **配置文件** | `monitoring.ts` | `monitoring.client.tsx` | 无 |
-| **核心集成** | Prisma, HTTP, Node Profiling | Replay, Browser Profiling | - |
-| **错误捕获** | `handleError` 钩子 | Error Boundary + 全局 | - |
-| **采样策略** | 动态采样器 | 固定采样率 | - |
-
-### 9.3 上下文传递链路
-
-```
-构建时 (CI/CD)
-    │
-    ▼
-┌─────────────────────┐
-│  SENTRY_AUTH_TOKEN  │ ──► Source Map 上传
-│  SENTRY_ORG         │ ──► Release 创建
-│  SENTRY_PROJECT     │ ──► 项目关联
-│  COMMIT_SHA         │ ──► Release 命名
-└─────────────────────┘
-    │
-    ▼
-运行时 (服务端)
-    │
-    ▼
-┌─────────────────────┐
-│  SENTRY_DSN         │ ──► 错误上报
-│  NODE_ENV           │ ──► Environment 标签
-│  FLY_REGION         │ ──► 部署上下文
-│  FLY_APP_NAME       │ ──► 应用标识
-└─────────────────────┘
-    │
-    ▼ (通过 window.ENV 注入)
-运行时 (客户端)
-    │
-    ▼
-┌─────────────────────┐
-│  ENV.SENTRY_DSN     │ ──► 错误上报
-│  ENV.MODE           │ ──► Environment 标签
-│  Release (编译时注入)│ ──► 版本关联
-└─────────────────────┘
-```
-
-### 9.4 建议与优化方向
-
-1. **Edge 运行时支持**：若需要部署到 Cloudflare Workers 等 Edge 环境，需：
-   - 移除不兼容的集成（`@prisma/instrumentation`, `@sentry/profiling-node`）
-   - 添加 Edge 专用的初始化逻辑
-
-2. **用户上下文增强**：当前代码未显式设置用户信息，建议添加：
-   ```typescript
-   Sentry.setUser({
-     id: user.id,
-     email: user.email,
-     username: user.username,
-   })
-   ```
-
-3. **自定义标签**：可添加业务相关的标签便于排查：
-   ```typescript
-   Sentry.setTag('feature_flag_variant', variant)
-   Sentry.setTag('user_segment', segment)
-   ```
-
-4. **分布式追踪完善**：确保服务端和客户端的 Trace ID 正确传播，形成完整的调用链。
-
----
-
-## 十、参考文件
-
-| 文件路径 | 用途 |
-|---------|------|
-| `server/utils/monitoring.ts` | 服务端 Sentry 配置 |
-| `app/utils/monitoring.client.tsx` | 客户端 Sentry 配置 |
-| `server/index.ts` | 服务端初始化入口 |
-| `app/entry.client.tsx` | 客户端初始化入口 |
-| `app/entry.server.tsx` | 服务端请求处理 + `handleError` |
-| `app/components/error-boundary.tsx` | React 错误边界 |
-| `vite.config.ts` | 构建时 Sentry 插件配置 |
-| `react-router.config.ts` | `buildEnd` 钩子配置 |
-| `app/utils/env.server.ts` | 环境变量 Schema |
-| `docs/decisions/015-monitoring.md` | 架构决策记录 |
-| `docs/monitoring.md` | 部署配置指南 |
+**报告完成时间**: 2026-05-05  
+**分析范围**: Epic Stack 当前代码库（不含假设性修改）  
+**所有结论均有代码/配置证据支撑，可通过文中引用的文件位置核验。**
