@@ -942,7 +942,9 @@ useToast(data.toast)
 // → setTimeout(..., 0) 调用 toast.success('Success', { description: '...' })
 ```
 
-**最终效果：** 页面右上角出现绿色成功提示，3-5 秒后自动消失。
+**最终效果：** 页面顶部中央（`position="top-center"`）出现绿色成功提示。
+
+> **源码依据**：展示位置由 `app/root.tsx` 第 231 行控制：`<EpicToaster closeButton position="top-center" theme={theme} />`。自动消失时长由 Sonner 库默认值决定（项目未自定义 `duration`）。
 
 ---
 
@@ -1011,6 +1013,9 @@ export function getRedirectCookieValue(request: Request) {
 | `toast.server.ts` | `en_toast` | Toast 消息 | 单次请求 (flash) |
 | `redirect-cookie.server.ts` | `redirectTo` | 登录后跳转目标 | 10 分钟 |
 | `auth.server.ts` | `en_session` | 用户登录态 | 30 天 |
+| `verification.server.ts` | `en_verification` | 2FA 验证 / 邮箱验证 | 10 分钟 |
+
+> **说明**：各 Cookie 名称来自各模块中 `createCookieSessionStorage` 的 `cookie.name` 配置。例如 `en_verification` 定义在 `app/utils/verification.server.ts` 第5行：`name: 'en_verification'`。
 
 **在 OAuth 回调中协同工作：**
 
