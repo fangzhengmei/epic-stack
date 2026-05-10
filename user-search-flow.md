@@ -319,11 +319,10 @@ generator client {
 }
 ```
 
-**生成命令** (`package.json:18`)：
+**生成命令**：
 
-```json
-"setup": "npm run build && prisma migrate deploy && prisma generate --sql && ..."
-```
+- 开发环境：`package.json:18` 中的 `setup` 脚本包含 `prisma generate --sql`
+- 生产环境：`other/litefs.yml:43-44` 中部署流程执行 `npx prisma generate --sql`
 
 ### 4.2 原生 SQL 查询定义 (`prisma/sql/searchUsers.sql`)
 
@@ -377,10 +376,11 @@ import { searchUsers } from '@prisma/client/sql'
 const users = await prisma.$queryRawTyped(searchUsers(like))
 ```
 
-**类型安全保障：**
+**类型安全保障（可被代码验证）：**
 
-1. **参数类型检查**：`searchUsers()` 函数只接受 `String` 类型参数
-2. **返回类型推断**：`users` 变量自动获得以下类型：
+1. **参数类型注解**：SQL 文件中 `-- @param {String} $1:like` 声明参数类型
+2. **Prisma 生成**：执行 `prisma generate --sql` 后自动生成类型安全函数
+3. **返回类型推断**：`users` 变量自动获得以下类型：
    ```typescript
    Array<{
      id: string
@@ -390,26 +390,26 @@ const users = await prisma.$queryRawTyped(searchUsers(like))
      imageObjectKey: string | null
    }>
    ```
-3. **SQL 注入防护**：Prisma 自动处理参数转义
+4. **SQL 注入防护**：Prisma 自动处理参数转义
 
 ### 4.4 技术方案取舍：为什么选择 Typed SQL？
 
-#### 4.4.1 可选方案对比
+#### 4.4.1 仓库中的可选方案对比
 
-| 方案 | 类型安全 | SQL 控制力 | 复杂度 | 性能 |
-|------|----------|-----------|--------|------|
-| **Prisma Typed SQL** (当前方案) | ✅ 完整 | ✅ 完全控制 | 中 | ✅ 最优 |
-| Prisma Query Builder | ✅ 完整 | ⚠️ 有限 | 低 | ✅ 好 |
-| 原生 SQL (`$queryRaw`) | ❌ 无 | ✅ 完全控制 | 低 | ✅ 最优 |
-| Drizzle ORM | ✅ 完整 | ✅ 完全控制 | 中 | ✅ 最优 |
-| Kysely | ✅ 完整 | ✅ 完全控制 | 中 | ✅ 最优 |
+以下对比仅基于 Epic Stack 仓库中实际使用或可验证的方案：
 
-#### 4.4.2 各方案详细分析
+| 方案 | 类型安全 | SQL 控制力 | 复杂度 | 性能 | 仓库验证 |
+|------|----------|-----------|--------|------|---------|
+| **Prisma Typed SQL** (当前方案) | ✅ 完整 | ✅ 完全控制 | 中 | ✅ 最优 | `prisma/sql/searchUsers.sql` |
+| Prisma Query Builder | ✅ 完整 | ⚠️ 有限 | 低 | ⚠️ 依赖查询 | 仓库中大量使用 |
+| 原生 SQL (`$queryRaw`) | ❌ 无 | ✅ 完全控制 | 低 | ✅ 最优 | Prisma 内置 |
 
-**方案 A：Prisma Query Builder（未采用）
+#### 4.4.2 各方案详细分析（基于仓库代码）
+
+**方案 A：Prisma Query Builder**
 
 ```typescript
-// 尝试用 Prisma Query Builder 实现相同查询
+// 用 Prisma Query Builder 实现部分功能
 const users = await prisma.user.findMany({
   select: {
     id: true,
@@ -423,20 +423,21 @@ const users = await prisma.user.findMany({
       { name: { contains: searchTerm } }
     ]
   },
-  orderBy: {
-    // ❌ 问题：无法按子查询排序
-    // Prisma 不支持：orderBy: { notes: { _count: 'desc' } } 这样的复杂排序
-  },
   take: 50
 })
 ```
 
-**局限性：**
-- ❌ **排序限制**：无法表达 `ORDER BY (SELECT ...)` 子查询排序
-- ❌ **关联性能**：Prisma 默认使用多个查询（`JOIN` 拆分为多个 `SELECT`），可能产生 N+1 问题
-- ⚠️ **LIKE 控制有限**：`contains` 是大小写敏感取决于数据库配置
+**仓库可验证的局限性**：
 
-**方案 B：原生 SQL `$queryRaw`（未采用）
+1. **排序限制**（无法在仓库中实现）：
+   - Prisma Query Builder 无法表达 `ORDER BY (SELECT ...)` 子查询排序
+   - 搜索需求中的"按最近笔记更新时间排序"无法用 Query Builder 实现
+
+2. **关联查询方式**：
+   - Prisma Query Builder 的 `include` 会执行多个查询
+   - Typed SQL 使用单个 `LEFT JOIN` 查询，更高效
+
+**方案 B：原生 SQL `$queryRaw`**
 
 ```typescript
 // 无类型安全的原生 SQL
@@ -449,61 +450,67 @@ const users = await prisma.$queryRaw`
   ORDER BY (...) DESC
   LIMIT 50
 `
-// users 类型为 any ❌
+// users 类型为 any
 ```
 
-**局限性：**
-- ❌ **无类型安全**：`users` 变量类型为 `any`
-- ❌ **重构风险**：修改 SQL 字段后 TypeScript 无法检测
-- ❌ **IDE 支持差**：无自动补全、无类型提示
+**仓库可验证的局限性**：
 
-**方案 C：Typed SQL（当前方案）**
+1. **无类型安全**：`users` 变量类型为 `any`，与 `docs/decisions/001-typescript-only.md` 的 "TypeScript only" 原则冲突
+2. **重构风险**：修改 SQL 字段后 TypeScript 无法检测
+3. **开发体验差**：无自动补全、无类型提示
+
+**方案 C：Typed SQL（当前方案，仓库中已实现）**
 
 ```typescript
-// prisma/sql/searchUsers.sql - 单独的 SQL 文件
+// prisma/sql/searchUsers.sql - 独立的 SQL 文件（仓库中存在）
 -- @param {String} $1:like
 SELECT ...
 
 // TypeScript 调用
 import { searchUsers } from '@prisma/client/sql'
 const users = await prisma.$queryRawTyped(searchUsers(like))
-// users 类型自动推断 ✅
+// users 类型自动推断
 ```
 
-**优势：**
-- ✅ **完整类型安全**
-- ✅ **完全 SQL 控制**：子查询、窗口函数、CTE 等高级特性
-- ✅ **性能最优**：单个优化的 SQL 查询
-- ✅ **SQL 文件管理**：SQL 代码独立管理，便于 DBA 审查
-- ✅ **IDE 支持**：Prisma VS Code 插件提供 SQL 语法高亮
+**仓库可验证的优势**：
 
-#### 4.4.3 决策矩阵
+1. **完整类型安全**：由 `prisma generate --sql` 生成类型
+2. **完全 SQL 控制**：子查询、窗口函数等高级特性都可使用
+3. **性能最优**：单个优化的 SQL 查询
+4. **SQL 文件管理**：SQL 代码在 `prisma/sql/` 目录独立管理
+5. **与仓库配置一致**：`prisma/schema.prisma:6` 启用了 `typedSql` preview feature
 
-| 需求 | Typed SQL | Query Builder | 原生 SQL |
-|------|-----------|---------------|----------|
-| 子查询排序 (ORDER BY) | ✅ 支持 | ❌ 不支持 | ✅ 支持 |
-| 类型安全 | ✅ 有 | ✅ 有 | ❌ 无 |
-| 单个 JOIN 查询 | ✅ 是 | ❌ 可能多个 | ✅ 是 |
-| SQL 独立文件 | ✅ 是 | ❌ 嵌入 TS | ⚠️ 可提取 |
-| 数据库可移植性 | ❌ SQL 原生 | ✅ Prisma 抽象 | ❌ SQL 原生 |
-| 学习成本 | 中 | 低 | 低 |
+#### 4.4.3 决策矩阵（可被仓库代码验证）
 
-**最终选择理由：**
+| 需求 | Typed SQL | Query Builder | 原生 SQL | 验证依据 |
+|------|-----------|---------------|----------|---------|
+| 子查询排序 (ORDER BY) | ✅ 支持 | ❌ 不支持 | ✅ 支持 | `prisma/sql/searchUsers.sql:157-163` |
+| 类型安全 | ✅ 有 | ✅ 有 | ❌ 无 | `@prisma/client/sql` 导入 |
+| 单个 JOIN 查询 | ✅ 是 | ❌ 可能多个 | ✅ 是 | `LEFT JOIN` 语句 |
+| SQL 独立文件 | ✅ 是 | ❌ 嵌入 TS | ⚠️ 可提取 | `prisma/sql/` 目录 |
+| TypeScript only 原则 | ✅ 符合 | ✅ 符合 | ❌ 不符合 | `docs/decisions/001-typescript-only.md` |
 
-1. **业务需求驱动**：搜索需要按"最近笔记更新时间"排序，这需要子查询，Prisma Query Builder 无法表达
+**最终选择理由（基于仓库代码）：**
 
-2. **类型安全优先**：Epic Stack 的核心理念是全栈类型安全，原生 SQL 的 `any` 类型不可接受
+1. **业务需求驱动**：
+   - 搜索需要按"最近笔记更新时间"排序
+   - 这需要 `ORDER BY (SELECT ...)` 子查询
+   - Prisma Query Builder 无法表达此排序
 
-3. **性能考量**：用户搜索是高频操作，单个优化的 SQL 查询比多个查询更高效
+2. **类型安全优先**：
+   - Epic Stack 的核心理念是全栈类型安全
+   - `docs/decisions/001-typescript-only.md` 明确 "TypeScript only"
+   - 原生 SQL 的 `any` 类型不可接受
 
-4. **SQL 可维护性**：复杂查询放在独立的 `.sql` 文件中，便于：
-   - 数据库管理员审查优化
-   - 版本控制中清晰的 diff
-   - SQL 格式化工具处理
+3. **性能考量**：
+   - 用户搜索是高频操作
+   - Typed SQL 使用单个 `LEFT JOIN` 查询
+   - 比 Query Builder 的多个查询更高效
 
-5. **与 Epic Stack 理念一致**：
-   - "TypeScript only" 原则 (`docs/decisions/001-typescript-only.md`)
-   - 数据库类型与应用类型同步 (`docs/database.md`)
+4. **SQL 可维护性**：
+   - 复杂查询在 `prisma/sql/searchUsers.sql` 独立文件中
+   - 便于数据库优化审查
+   - 版本控制中 diff 清晰
 
 ## 5. 用户头像渲染
 
@@ -517,9 +524,9 @@ export function getUserImgSrc(objectKey?: string | null) {
 }
 ```
 
-**逻辑：**
-- 有 `objectKey`：构建图片资源 URL，经过 URL 编码
-- 无 `objectKey`：使用默认头像 `/public/img/user.png`
+**逻辑（可被代码验证）：**
+- 有 `objectKey`：构建图片资源 URL，经过 `encodeURIComponent` 编码
+- 无 `objectKey`：使用默认头像 `/img/user.png`（位于 `public/` 目录）
 
 ### 5.2 图片组件使用 (`app/routes/users/index.tsx:50-56`)
 
@@ -533,211 +540,252 @@ export function getUserImgSrc(objectKey?: string | null) {
 />
 ```
 
-**使用 `openimg` 库进行图片优化：**
+### 5.3 openimg 实际责任边界
 
-1. **上下文配置** (`app/root.tsx:198-201`)：
-   ```tsx
-   <OpenImgContextProvider
-     optimizerEndpoint="/resources/images"
-     getSrc={getImgSrc}
-   >
-   ```
+openimg 分为两部分，应用代码提供的配置如下：
 
-2. **自定义 URL 构建** (`app/utils/misc.tsx:18-44`)：
-   - 将优化参数（宽、高、格式、裁剪方式）直接添加到查询字符串
-   - 生成美观的 URL 格式：`/resources/images?objectKey=...&h=256&w=256`
+**A. 客户端部分 (`openimg/react`)**
 
-### 5.3 图片资源服务 (`app/routes/resources/images.tsx`)
-
-**缓存策略** (lines 32-33)：
-```typescript
-headers.set('Cache-Control', 'public, max-age=31536000, immutable')
-// 一年缓存，不可变资源
+**配置位置** (`app/root.tsx:198-201`)：
+```tsx
+<OpenImgContextProvider
+  optimizerEndpoint="/resources/images"
+  getSrc={getImgSrc}
+>
 ```
 
-**图片来源获取** (lines 37-79)：
-
-| 情况 | 来源 |
-|------|------|
-| 有 `objectKey` | 从对象存储获取（使用签名 URL） |
-| 有 `src` 且是完整 URL | 从外部 URL 获取（白名单验证） |
-| 有 `src` 且以 `/assets` 开头 | 从 Vite 构建资源获取 |
-| 其他 `src` | 从 `public` 文件夹获取 |
-
-**对象存储签名** (`app/utils/storage.server.ts:169-178`)：
-
+**应用代码提供的 `getImgSrc`** (`app/utils/misc.tsx:18-44`)：
 ```typescript
-export function getSignedGetRequestInfo(key: string) {
-  // 使用 AWS S3 签名算法 V4
-  // 生成临时访问 URL 和认证头
-  return { url, headers: baseHeaders }
+export function getImgSrc({
+  height,
+  optimizerEndpoint,
+  src,
+  width,
+  fit,
+  format,
+}: GetSrcArgs) {
+  // 自定义 URL 构建逻辑
+  if (src.startsWith(optimizerEndpoint)) {
+    const [endpoint, query] = src.split('?')
+    const searchParams = new URLSearchParams(query)
+    searchParams.set('h', height.toString())
+    searchParams.set('w', width.toString())
+    if (fit) searchParams.set('fit', fit)
+    if (format) searchParams.set('format', format)
+    return `${endpoint}?${searchParams.toString()}`
+  }
+  return defaultGetSrc({ height, optimizerEndpoint, src, width, fit, format })
 }
 ```
 
-### 5.4 技术方案取舍：为什么选择 openimg？
+**客户端责任边界：**
 
-#### 5.4.1 图片处理方案对比
+| 责任方 | 功能 | 验证依据 |
+|--------|------|---------|
+| **openimg/react** | 提供 `<Img>` 组件 | 多个文件中 `import { Img } from 'openimg/react'` |
+| **openimg/react** | 从 Context 读取配置 | `OpenImgContextProvider` |
+| **应用代码** | 提供 `optimizerEndpoint` | `app/root.tsx:199` |
+| **应用代码** | 提供自定义 `getImgSrc` 函数 | `app/utils/misc.tsx:18-44` |
+| **应用代码** | 构建优化后的图片 URL | `getImgSrc` 将参数添加到查询字符串 |
 
-| 方案 | 服务端处理 | 格式协商 | 响应式 | CDN 友好 | 复杂度 |
-|------|-----------|---------|--------|-----------|--------|
-| **openimg** (当前方案) | ✅ Node.js | ✅ 自动 | ✅ 自动 | ✅ URL 缓存友好 | 中 |
-| `next/image` | ✅ Node.js | ✅ 自动 | ✅ 自动 | ⚠️ 需要配置 | 低 |
-| Cloudinary/Imgix | ✅ 第三方 | ✅ 自动 | ✅ 自动 | ✅ 优秀 | 高 ($) |
-| 纯 `<img>` | ❌ 无 | ❌ 无 | ⚠️ 手动 srcset | ⚠️ 手动 | 低 |
+**B. 服务端部分 (`openimg/node`)**
 
-#### 5.4.2 各方案详细分析
+**配置位置** (`app/routes/resources/images.tsx`)：
+```typescript
+import { getImgResponse } from 'openimg/node'
 
-**方案 A：纯 `<img>` + `srcset`（未采用）
+export async function loader({ request }: Route.LoaderArgs) {
+  const url = new URL(request.url)
+  const searchParams = url.searchParams
+  const headers = new Headers()
+  headers.set('Cache-Control', 'public, max-age=31536000, immutable')
+  const objectKey = searchParams.get('objectKey')
+
+  return getImgResponse(request, {
+    headers,
+    allowlistedOrigins: [
+      getDomainUrl(request),
+      process.env.AWS_ENDPOINT_URL_S3,
+    ].filter(Boolean),
+    cacheFolder: await getCacheDir(),
+    getImgSource: () => {
+      // 应用代码决定从哪里获取原始图片
+      if (objectKey) {
+        const { url: signedUrl, headers: signedHeaders } =
+          getSignedGetRequestInfo(objectKey)
+        return { type: 'fetch', url: signedUrl, headers: signedHeaders }
+      }
+      // ... 其他来源
+    },
+  })
+}
+```
+
+**服务端责任边界：**
+
+| 责任方 | 功能 | 验证依据 |
+|--------|------|---------|
+| **应用代码** | 决定图片来源（对象存储/文件系统） | `getImgSource` 回调 |
+| **应用代码** | 生成对象存储签名 URL | `app/utils/storage.server.ts:169-178` |
+| **应用代码** | 设置缓存策略 | `Cache-Control: public, max-age=31536000, immutable` |
+| **应用代码** | 设置图片来源白名单 | `allowlistedOrigins` |
+| **应用代码** | 指定缓存目录 | `cacheFolder: await getCacheDir()` |
+| **openimg/node** | 处理图片转换（由 sharp 提供） | `docs/image-optimization.md:12` |
+| **openimg/node** | 处理请求参数（w, h, format, fit） | `docs/image-optimization.md:10` |
+
+### 5.4 图片处理链路的实际形式
+
+**基于仓库代码和文档的完整链路：**
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                    头像渲染完整链路（可被代码验证）                      │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│  ┌─────────────────────────────────────────────────────────────┐   │
+│  │  1. 客户端渲染阶段                                            │   │
+│  ├─────────────────────────────────────────────────────────────┤   │
+│  │                                                             │   │
+│  │  <Img src="/resources/images?objectKey=xxx"                  │   │
+│  │       width={256} height={256} />                           │   │
+│  │       │                                                     │   │
+│  │       ▼                                                     │   │
+│  │  OpenImgContextProvider 读取配置                             │   │
+│  │  - optimizerEndpoint: "/resources/images"                    │   │
+│  │  - getSrc: 应用自定义函数                                    │   │
+│  │       │                                                     │   │
+│  │       ▼                                                     │   │
+│  │  应用代码 getImgSrc() 构建优化 URL                            │   │
+│  │  结果：/resources/images?objectKey=xxx&w=256&h=256          │   │
+│  │                                                             │   │
+│  └─────────────────────────────────────────────────────────────┘   │
+│                              │                                      │
+│                              ▼                                      │
+│  ┌─────────────────────────────────────────────────────────────┐   │
+│  │  2. 服务端处理阶段                                            │   │
+│  ├─────────────────────────────────────────────────────────────┤   │
+│  │                                                             │   │
+│  │  GET /resources/images?objectKey=xxx&w=256&h=256            │   │
+│  │       │                                                     │   │
+│  │       ▼                                                     │   │
+│  │  应用代码 images.tsx loader                                  │   │
+│  │  - 设置 Cache-Control 头                                    │   │
+│  │  - 配置 allowlistedOrigins                                  │   │
+│  │  - 配置 cacheFolder                                         │   │
+│  │  - 实现 getImgSource 回调                                    │   │
+│  │       │                                                     │   │
+│  │       ▼                                                     │   │
+│  │  应用代码 getImgSource() 决定图片来源                          │   │
+│  │  objectKey 存在 → 调用 getSignedGetRequestInfo()            │   │
+│  │                  → 返回 Tigris 签名 URL                      │   │
+│  │       │                                                     │   │
+│  │       ▼                                                     │   │
+│  │  getImgResponse(request, { ... })                           │   │
+│  │  (openimg/node 处理图片优化)                                 │   │
+│  │  - 从 getImgSource 获取原始图片                               │   │
+│  │  - 使用 sharp 进行尺寸调整、格式转换                           │   │
+│  │  - 缓存到本地目录                                             │   │
+│  │       │                                                     │   │
+│  │       ▼                                                     │   │
+│  │  返回优化后的图片（带 Cache-Control 头）                        │   │
+│  │                                                             │   │
+│  └─────────────────────────────────────────────────────────────┘   │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### 5.5 技术方案取舍：为什么选择 openimg？
+
+#### 5.5.1 仓库中图片处理方案对比
+
+以下对比基于 Epic Stack 仓库中的实际配置和文档：
+
+| 方案 | 仓库验证 | 自托管 | 服务端优化 | 与 React Router 集成 |
+|------|---------|--------|-----------|---------------------|
+| **openimg** (当前方案) | `docs/image-optimization.md:3` | ✅ 是 | ✅ 是 | ✅ 深度集成 |
+| 纯 `<img>` | 可行 | ✅ 是 | ❌ 否 | ⚠️ 简单 |
+| 第三方 CDN (Cloudinary/Imgix) | 未配置 | ❌ 否 | ✅ 是 | ⚠️ 需额外集成 |
+
+#### 5.5.2 各方案详细分析（基于仓库文档）
+
+**方案 A：纯 `<img>`**
 
 ```tsx
-// 手动实现响应式图片
-<img
-  src={getUserImgSrc(objectKey)}
-  srcSet={`
-    ${getUserImgSrc(objectKey, 64)} 64w,
-    ${getUserImgSrc(objectKey, 128)} 128w,
-    ${getUserImgSrc(objectKey, 256)} 256w
-  `}
-  sizes="64px"
-  alt={alt}
-/>
+// 手动实现
+<img src={getUserImgSrc(objectKey)} alt={alt} />
 ```
 
-**局限性：**
-- ❌ **无服务端优化**：需要预先准备多种尺寸的图片
-- ❌ **无格式协商**：无法根据浏览器支持选择 WebP/AVIF
-- ❌ **维护成本高**：每个使用图片都需要手动配置
-- ❌ **缓存复杂**：多种尺寸的缓存管理
+**仓库可验证的局限性**：
 
-**方案 B：Cloudinary/Imgix 等第三方服务（未采用）
+1. **无服务端优化**：
+   - 需要预先准备多种尺寸的图片
+   - 无法根据浏览器能力选择最优格式
 
-```tsx
-// Cloudinary 示例
-<img src={`https://res.cloudinary.com/demo/image/upload/w_64,h_64,c_fill/${objectKey}`} />
-```
+2. **与决策文档冲突**：
+   - `docs/decisions/041-image-optimization.md:9-16` 明确说明需要图片优化
+   - "optimizing images significantly improves web performance"
 
-**局限性：**
-- ❌ **额外成本**：按量付费
-- ❌ **供应商锁定**：难以迁移
-- ❌ **数据隐私**：用户头像数据传给第三方
-- ❌ **本地开发复杂**：需要 mock 或开发环境配置
+**方案 B：第三方 CDN (Cloudinary/Imgix)**
 
-**方案 C：openimg（当前方案）**
+**仓库可验证的局限性**：
 
-```tsx
-// openimg 自动优化流程：
-// 1. 自动生成 srcset
-// 2. 自动格式协商（WebP/AVIF）
-// 3. 自动质量优化
-// 4. 服务端图片处理
-```
+1. **不在默认配置中**：
+   - 仓库中没有 Cloudinary/Imgix 相关依赖
+   - 环境变量配置针对 Tigris (`AWS_ENDPOINT_URL_S3`, `BUCKET_NAME`)
 
-**工作原理：
+2. **与 Epic Stack 理念不完全一致**：
+   - `docs/image-optimization.md:14-17` 强调 "limit services"
+   - 优先选择直接集成到 web server 的方案
 
-```
-浏览器请求：
-<img src="/resources/images?objectKey=xxx&w=256&h=256"
-     ↓
-openimg/node getImgResponse()
-     ↓
-检查浏览器 Accept 头
-     ├─ 支持 AVIF → 转换为 AVIF
-     ├─ 支持 WebP → 转换为 WebP
-     └─ 否则 → 保持原格式
-     ↓
-使用 sharp 进行：
-├─ 调整尺寸 (w=256, h=256
-├─ 质量优化
-└─ 格式转换
-     ↓
-返回优化后的图片
-     ↓
-缓存到本地缓存目录
-```
+**方案 C：openimg（当前方案，仓库中已实现）**
 
-#### 5.4.3 openimg 核心优势
+**仓库可验证的优势**：
 
-**1. 自动响应式图片 (`openimg/react 的优势**
+1. **符合决策文档**：
+   - `docs/decisions/041-image-optimization.md:33-35` 明确选择 openimg
+   - "easy to use but also highly configurable"
 
-```tsx
-// 开发者只需写：
-<Img src={src} width={256} height={256} />
+2. **与现有架构集成**：
+   - React Router SSR 路由 (`app/routes/resources/images.tsx`)
+   - Tigris 对象存储 (`app/utils/storage.server.ts`)
+   - 统一的图片 API（多个文件使用 `<Img>` 组件）
 
-// openimg 自动生成：
-// - srcset 包含多种尺寸
-// - 根据设备像素比选择合适尺寸
-// - 自动 sizes 属性
-```
+3. **配置明确**：
+   - 客户端：`OpenImgContextProvider` 在 `app/root.tsx`
+   - 服务端：`getImgResponse` 在 `app/routes/resources/images.tsx`
+   - 缓存目录：`./tests/fixtures/openimg`（开发）或 `/data/images`（生产）
 
-**2. 格式协商 (`app/routes/resources/images.tsx:37-79`)
+#### 5.5.3 决策矩阵（可被仓库代码/文档验证）
 
-| 浏览器支持 | 返回格式 | 体积对比 |
-|-----------|----------|----------|
-| Safari (macOS 13+/iOS 16+) | AVIF | 最小 |
-| Chrome/Firefox/Edge | WebP | 较小 |
-| 其他浏览器 | 原始格式 (JPEG/PNG) | 较大 |
+| 需求 | openimg | 纯 `<img>` | 第三方 CDN | 验证依据 |
+|------|---------|-----------|-----------|---------|
+| 服务端图片优化 | ✅ 有 | ❌ 无 | ✅ 有 | `docs/image-optimization.md:12` |
+| 自托管 | ✅ 是 | ✅ 是 | ❌ 否 | 无第三方依赖 |
+| 与 React Router 集成 | ✅ 原生 | ⚠️ 简单 | ⚠️ 需配置 | `app/routes/resources/images.tsx` |
+| 与 Tigris 集成 | ✅ 已配置 | ⚠️ 需手动 | ⚠️ 需迁移 | `app/utils/storage.server.ts` |
+| 符合决策文档 | ✅ 是 | ❌ 否 | ⚠️ 可替代 | `docs/decisions/041-image-optimization.md` |
+| 本地开发体验 | ✅ 简单 | ✅ 简单 | ⚠️ 需要 mock | `./tests/fixtures/openimg` |
 
-**体积优化效果：**
-- JPEG → WebP：约减少 25-35% 体积
-- JPEG → AVIF：约减少 40-60% 体积
+**最终选择理由（基于仓库代码和文档）：**
 
-**3. 与 Epic Stack 架构的深度集成**
+1. **符合决策文档**：
+   - `docs/decisions/041-image-optimization.md` 明确记录了选择 openimg 的决策
+   - 目标是 "integrate a simple image optimization solution directly into the web server"
 
-```
-┌─────────────────────────────────────────────────────────┐
-│              openimg 与 Epic Stack 集成                     │
-├─────────────────────────────────────────────────────────┤
-│                                                      │
-│  React Router SSR  ──▶  服务端图片路由              │
-│       │                      │                        │
-│       ▼                      ▼                        │
-│  OpenImgContextProvider    getImgResponse()          │
-│       │                      │                        │
-│       │              ┌──────┴──────┐                  │
-│       │              │               │                  │
-│       ▼              ▼               ▼                  │
-│  客户端 URL 构建   图片处理 (sharp)   缓存策略          │
-│  (getImgSrc)    格式转换          (Cache-Control)   │
-│                      │                        │
-│                      ▼                        │
-│              对象存储 (S3 签名)      本地缓存目录        │
-│                                                      │
-└─────────────────────────────────────────────────────────┘
-```
+2. **自托管优先**：
+   - Epic Stack 强调可控性和独立性
+   - 用户头像数据不经过第三方服务
+   - 与 Tigris 对象存储无缝集成
 
-#### 5.4.4 决策矩阵
+3. **与现有架构深度集成**：
+   - 使用 React Router 路由作为图片优化端点
+   - 服务端渲染时正常工作
+   - 本地开发使用 `./tests/fixtures/openimg` 缓存目录
 
-| 需求 | openimg | 第三方 CDN | 手动实现 |
-|------|---------|---------|----------|
-| 自托管 | ✅ 是 | ❌ 否 | ✅ 是 |
-| 格式自动优化 | ✅ 是 | ✅ 是 | ❌ 否 |
-| 响应式自动 | ✅ 是 | ✅ 是 | ❌ 手动 |
-| 成本 | ✅ 免费 | ❌ 付费 | ✅ 免费 |
-| 隐私 | ✅ 数据在自己服务器 | ❌ 数据传给第三方 | ✅ 数据在自己服务器 |
-| 本地开发 | ✅ 简单 | ⚠️ 需要配置 | ✅ 简单 |
-| 与 React Router 集成 | ✅ 原生支持 SSR | ⚠️ 需要额外配置 | ⚠️ 需要额外代码 |
-| 缓存控制 | ✅ 灵活 | ✅ 灵活 | ⚠️ 需要手动 |
-
-**最终选择理由：**
-
-1. **全栈一致性**：openimg 与 React Router 深度集成，支持 SSR 和服务端图片处理
-
-2. **自托管优先**：Epic Stack 强调可控性，用户头像数据不经过第三方
-
-3. **成本控制**：
-   - 避免图片处理在自有服务器
-   - 无需额外 SaaS 费用
-   - 与应用部署一起扩展
-
-4. **开发体验**：
-   - 统一的图片处理 API
-   - 无需学习成本低
-   - 与现有架构自然集成
-
-5. **与 Epic Stack 理念一致**：
-   - 图像优化决策文档 (`docs/image-optimization.md`)
-   - Tigris 图像存储 (`docs/image-storage.md`)
-   - 强调开发者体验和可控性
+4. **可验证的配置**：
+   - 客户端：`OpenImgContextProvider` 配置 `optimizerEndpoint` 和 `getImgSrc`
+   - 服务端：`getImgResponse` 配置 `getImgSource`、`cacheFolder`、`allowlistedOrigins`
+   - 缓存策略：`Cache-Control: public, max-age=31536000, immutable`
 
 ## 6. 完整数据流图
 
@@ -797,12 +845,12 @@ openimg/node getImgResponse()
 
 ### 7.1 类型安全全链路
 
-| 层级 | 类型安全机制 | 文件位置 |
-|------|-------------|----------|
-| 路由参数 | `Route.LoaderArgs` 自动生成类型 | `+types/index.ts` |
+| 层级 | 类型安全机制 | 验证依据 |
+|------|-------------|---------|
+| 路由参数 | `Route.LoaderArgs` 自动生成类型 | React Router 类型生成 |
 | Loader 数据 | `as const` 断言 + `Route.ComponentProps` | `app/routes/users/index.tsx:19,22` |
 | SQL 参数 | Prisma Typed SQL 生成 `searchUsers()` 函数 | `prisma/sql/searchUsers.sql` |
-| SQL 返回值 | Prisma 自动推断查询结果类型 | `prisma/sql/searchUsers.sql` |
+| SQL 返回值 | Prisma 自动推断查询结果类型 | `prisma generate --sql` |
 
 ### 7.2 性能优化
 
@@ -875,22 +923,21 @@ openimg/node getImgResponse()
 
 ### 10.1 Typed SQL vs 其他方案
 
-| 维度 | 决策 | 原因 |
-|------|------|------|
-| 排序需求 | Typed SQL | 需要子查询排序，Query Builder 不支持 |
-| 类型安全 | Typed SQL | 符合 Epic Stack "TypeScript only" 原则 |
-| 性能 | Typed SQL | 单个优化查询优于多个查询 |
-| 可维护性 | Typed SQL | SQL 独立文件，便于审查优化 |
+| 维度 | 决策 | 可验证依据 |
+|------|------|-----------|
+| 排序需求 | Typed SQL | 子查询排序需求，Query Builder 不支持 |
+| 类型安全 | Typed SQL | `docs/decisions/001-typescript-only.md` |
+| 性能 | Typed SQL | 单个 LEFT JOIN 查询 |
+| 可维护性 | Typed SQL | `prisma/sql/` 独立目录 |
 
 ### 10.2 openimg vs 其他方案
 
-| 维度 | 决策 | 原因 |
-|------|------|------|
-| 自托管 | openimg | 符合 Epic Stack 可控性理念 |
-| 成本 | openimg | 免费，随应用扩展 |
-| 隐私 | openimg | 用户数据不经过第三方 |
-| 集成 | openimg | 与 React Router SSR 深度集成 |
-| 开发体验 | openimg | 统一 API，低学习成本 |
+| 维度 | 决策 | 可验证依据 |
+|------|------|-----------|
+| 图片优化 | openimg | `docs/decisions/041-image-optimization.md` |
+| 自托管 | openimg | 无第三方服务依赖 |
+| 架构集成 | openimg | React Router 路由 + Tigris 存储 |
+| 本地开发 | openimg | `./tests/fixtures/openimg` 缓存目录 |
 
 ## 11. 文件位置索引
 
@@ -902,11 +949,12 @@ openimg/node getImgResponse()
 | SQL 查询定义 | `prisma/sql/searchUsers.sql` |
 | 数据库模型 | `prisma/schema.prisma` |
 | Prisma 客户端 | `app/utils/db.server.ts` |
-| 工具函数（头像 URL、防抖等） | `app/utils/misc.tsx` |
+| 工具函数（头像 URL、getImgSrc 等） | `app/utils/misc.tsx` |
 | 图片资源路由 | `app/routes/resources/images.tsx` |
 | 存储服务（签名 URL） | `app/utils/storage.server.ts` |
 | 搜索 E2E 测试 | `tests/e2e/search.test.ts` |
 | 用户详情页 | `app/routes/users/$username/index.tsx` |
-| 架构决策文档 | `docs/decisions/*.md` |
+| TypeScript only 决策 | `docs/decisions/001-typescript-only.md` |
+| 图片优化决策 | `docs/decisions/041-image-optimization.md` |
 | 图片优化文档 | `docs/image-optimization.md` |
 | 图像存储文档 | `docs/image-storage.md` |
