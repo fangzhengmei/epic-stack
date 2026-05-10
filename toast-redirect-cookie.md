@@ -271,9 +271,50 @@ export function useToast(toast?: Toast | null) {
 
 **设计要点：**
 - `useEffect`: 仅在 toast 变化时触发
-- `setTimeout(..., 0)`: 推入微任务队列，确保 DOM 已渲染
+- `setTimeout(..., 0)`: 推入**宏任务队列 (macrotask queue)**，在当前宏任务 + 所有微任务 + 渲染完成后执行
 - `showToast[toast.type]`: 动态调用 `toast.success()`, `toast.error()`, `toast.message()`
 - `id: toast.id`: 使用服务端生成的 ID，防止重复显示
+
+#### `setTimeout(0)` 的事件循环时序详解
+
+```
+事件循环执行顺序（从 useEffect 回调开始）：
+
+第 1 步：当前宏任务 (宏任务 A)
+  ├── useEffect 回调执行
+  │     └── setTimeout(callback, 0)  ← 注册到宏任务队列尾部
+  └── React 同步渲染完成（Commit 阶段）
+
+第 2 步：微任务队列 (microtask queue)
+  ├── Promise.then() 回调
+  ├── queueMicrotask() 回调
+  └── MutationObserver 回调
+       ↓ 全部执行完毕
+
+第 3 步：渲染更新 (Render Update)
+  ├── 样式计算 (Style Recalc)
+  ├── 布局 (Layout)
+  └── 绘制 (Paint)
+       ↓ DOM 已完全渲染到屏幕
+
+第 4 步：下一个宏任务 (宏任务 B)
+  └── setTimeout 回调执行  ← 此时调用 Sonner 的 toast API
+       └── Toast DOM 插入并显示
+```
+
+**对展示时机的实际影响：**
+
+| 场景 | 无 setTimeout | 有 setTimeout(0) |
+|------|--------------|-----------------|
+| Toast 插入时机 | 与页面内容同步渲染 | 在页面内容渲染**之后** |
+| 视觉效果 | 可能与页面过渡动画冲突 | 页面先渲染完成，Toast 平滑浮现 |
+| 动画时序 | 过渡动画与 Toast 入场动画竞态 | 过渡动画完成后 Toast 才入场 |
+| 重排风险 | Toast 高度可能影响布局计算 | 布局已稳定，不影响初始渲染 |
+
+**为什么必须用 setTimeout 而非 queueMicrotask？**
+- `queueMicrotask` 会在**渲染之前**执行
+- `setTimeout(0)` 保证在**渲染之后**执行
+- Sonner 内部依赖 DOM 测量和动画队列，必须等待布局稳定
 
 ### 6.3 Root 组件集成
 
