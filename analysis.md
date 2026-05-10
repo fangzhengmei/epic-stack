@@ -363,106 +363,253 @@ export async function action({ request }: Route.ActionArgs) {
 | 路径 B | Token 不匹配 | 3xx | Rickroll 重定向 | 无日志 |
 | 路径 C | 请求体格式错误 | 400/500 | Zod 错误 | 无专门日志 |
 
-#### 3.0.5 Token 缺失/不匹配时调用侧的实际可见结果
+#### 3.0.5 Token 缺失 vs Token 不匹配：两种场景的关键区别
 
-##### 3.0.5.1 fetch 重定向行为分析
+##### 3.0.5.1 场景 A：INTERNAL_COMMAND_TOKEN 缺失（启动期失败）
 
-**关键知识：** Node.js fetch 默认行为
+**前置条件：**
+- 某个实例的环境变量 `INTERNAL_COMMAND_TOKEN` 未设置或为空
+- 该实例可能是 Primary 或 Replica
+
+**失败路径：**
 
 ```
-Node.js fetch 默认配置 (redirect: 'follow')
-├── 3xx 响应时自动跟随重定向
-├── 重定向到外部 URL (youtube.com) 时：
-│   ├── 发起新请求
-│   ├── 跟随所有重定向链
-│   └── 返回最终页面的 Response
-└── response.ok 判定：
-    ├── 2xx → response.ok = true ✅
-    ├── 3xx (在最终响应前) → 已被 fetch 消费
-    └── 4xx/5xx → response.ok = false ❌
+启动期检查 (entry.server.tsx:22):
+├── init() 被调用
+│       ↓
+├── env.server.ts:38-47 执行 Zod 验证
+│       ├── schema.safeParse(process.env)
+│       └── INTERNAL_COMMAND_TOKEN: z.string() (非 optional)
+│       ↓
+├── parsed.success === false
+│       ↓
+├── console.error 输出错误：
+│   │
+│   └── ❌ Invalid environment variables:
+│       └── INTERNAL_COMMAND_TOKEN: [ 'Required' ]
+│       ↓
+└── throw new Error('Invalid environment variables')
+    │
+    └── 进程崩溃退出，应用无法启动
 ```
 
-**Token 不匹配场景的实际流程：**
+**关键特点：**
+- **快速失败 (Fail Fast)**：启动时立即检测到问题
+- **高可观测性**：明确的错误日志指向问题
+- **影响范围**：单个实例无法启动，其他实例可能正常
+- **故障模式**：实例级别的停机，而非功能级别的静默失效
+
+**观测信号（调用侧/运维侧）：**
+
+| 观测维度 | 信号 | 可操作性 |
+|---------|------|---------|
+| 进程状态 | 实例进程不存在或不断重启 | ✅ 立即可见 |
+| 容器日志 | 明确的 `Invalid environment variables` | ✅ 立即可定位 |
+| 健康检查 | `/resources/healthcheck` 无响应 | ✅ 告警触发 |
+| 部署流水线 | 新实例无法通过健康检查 | ✅ 回滚触发 |
+
+##### 3.0.5.2 场景 B：INTERNAL_COMMAND_TOKEN 不匹配（运行期失败）
+
+**前置条件：**
+- 所有实例的 `INTERNAL_COMMAND_TOKEN` 都已设置（启动期验证通过）
+- 但至少两个实例的值不同
+- 例如：Replica A = "token-a"，Primary = "token-b"
+
+**失败路径（运行时）：**
 
 ```
 时间线：
-T0 Replica 发起 fetch (POST /admin/cache/sqlite)
+T0 所有实例成功启动（Token 格式正确，但值不同）
     │
-    ├── 请求到达 Primary 实例
-    │       ↓
-    ├── Token 验证失败 (isAuthorized = false)
-    │       ↓
-    ├── Primary 返回 302/303 重定向
-    │       ├── Location: https://www.youtube.com/watch?v=dQw4w9WgXcQ
-    │       └── 状态码：取决于 React Router redirect()
+T1 Replica 发起 cache.set(key, entry) 调用
     │
-    ├── fetch (redirect: 'follow' 默认)
+    ├── getInstanceInfo() → currentIsPrimary = false
     │       ↓
-    ├── 自动跟随重定向到 youtube.com
+    ├── void updatePrimaryCacheValue({ key, cacheValue: entry })
     │       ↓
-    ├── youtube.com 返回 200 OK (或其他 2xx)
+    ├── 构建请求头：
+    │   └── Authorization: `Bearer ${Replica.Token}`  // "token-a"
     │       ↓
-    └── fetch 返回的 Response：
+    ├── fetch 发起到 Primary 的 /admin/cache/sqlite
+    │       ↓
+    ├── Primary 接收请求，执行 Token 验证：
+    │   │
+    │   ├── const token = process.env.INTERNAL_COMMAND_TOKEN  // "token-b"
+    │   ├── const isAuthorized = request.headers.get('Authorization') === `Bearer ${token}`
+    │   └── isAuthorized = false  // "token-a" !== "token-b"
+    │       ↓
+    ├── Primary 返回 302 重定向：
+    │   │
+    │   └── return redirect('https://www.youtube.com/watch?v=dQw4w9WgXcQ')
+    │       │
+    │       ├── HTTP/1.1 302 Found
+    │       └── Location: https://www.youtube.com/watch?v=dQw4w9WgXcQ
+    │       ↓
+    ├── Replica 侧 fetch 默认行为：
+    │   │
+    │   ├── redirect: 'follow'（默认配置）
+    │   ├── 自动跟随重定向
+    │   └── 发起新请求到 youtube.com
+    │       ↓
+    ├── YouTube 返回 200 OK
+    │       ↓
+    └── fetch 返回 Response：
         ├── response.ok = true ✅
         ├── response.status = 200
         ├── response.statusText = 'OK'
-        └── response.body = YouTube 页面 HTML
+        └── response.body = YouTube HTML
 
 调用侧判定：
 .then((response) => {
   if (!response.ok) {  // response.ok === true，不进入此分支
-    console.error(...)  // ❌ 不会执行！静默失败！
+    console.error(...)  // ❌ 不会执行！
   }
 })
-// 🔥 结果：缓存写入失败，但没有任何日志！
+// 🔥 结果：缓存写入失败，但没有任何日志！完全静默！
 ```
 
-##### 3.0.5.2 React Router redirect() 的状态码
+**关键特点：**
+- **延迟失败 (Silent Failure)**：启动期正常，运行时静默失效
+- **低可观测性**：没有任何错误迹象
+- **影响范围**：功能级别的失效，实例仍在运行
+- **故障模式**：缓存逐渐过期，性能逐渐下降
+
+##### 3.0.5.3 fetch 重定向行为的深度分析
+
+**Node.js fetch 默认配置：**
 
 ```
-React Router redirect() 函数行为：
-├── redirect('url') → 默认 302 Found
-├── redirect('url', 301) → 301 Moved Permanently
-├── redirect('url', 303) → 303 See Other
-└── 响应头包含 Location
+fetch(url, options) 默认行为：
+├── redirect: 'follow'
+│   ├── 自动跟随所有 3xx 响应
+│   ├── 最多跟随 20 次重定向（浏览器兼容）
+│   └── 返回最终响应的 Response 对象
+│
+├── response.ok 的定义：
+│   └── response.status 在 200-299 范围内
+│
+└── 3xx 状态码在跟随重定向后：
+    ├── 原始 3xx 响应被"消费"
+    ├── 最终响应的状态码决定 response.ok
+    └── 无法通过 response.ok 检测是否发生过重定向
+```
+
+**Token 不匹配时的状态码链：**
+
+```
+请求链：
+├── 第 1 次请求：POST /admin/cache/sqlite
+│   └── 响应：302 Found (重定向到 YouTube)
+│
+├── 第 2 次请求：GET youtube.com/watch?v=...
+│   └── 响应：可能是 302/303 (Google 登录重定向)
+│
+├── 第 N 次请求：最终页面
+│   └── 响应：200 OK
+│
+└── fetch 返回的 Response：
+    ├── response.ok = true (200 在 2xx 范围内)
+    ├── response.status = 200
+    ├── response.url = 最终 URL (可能是 accounts.google.com 或 youtube.com)
+    └── 原始 302 响应的信息完全丢失！
+```
+
+##### 3.0.5.4 React Router redirect() 的行为细节
+
+```
+React Router redirect() 函数：
+├── 返回值类型：TypedResponse
+├── 默认状态码：302 Found
+├── 响应头：
+│   ├── Location: <目标 URL>
+│   └── 其他标准响应头
+└── 在 Remix/React Router 路由中：
+    ├── loader/action 返回 redirect
+    ├── 框架处理为 HTTP 3xx 响应
+    └── 不执行后续代码
 ```
 
 **代码位置**：`sqlite.server.ts:47`
 ```typescript
 return redirect('https://www.youtube.com/watch?v=dQw4w9WgXcQ')
-// 默认返回 302 Found，包含 Location 头
+// 等价于：
+// return new Response(null, {
+//   status: 302,
+//   headers: { Location: 'https://www.youtube.com/watch?v=dQw4w9WgXcQ' }
+// })
 ```
 
-##### 3.0.5.3 静默失败的完整证明
+##### 3.0.5.5 重写后的失败场景矩阵（带前置条件）
 
-**调用侧代码** (`cache.server.ts:166-176`)：
-```typescript
-void updatePrimaryCacheValue({
-  key,
-  cacheValue: entry,
-}).then((response) => {
-  // ⚠️ 致命问题：只有 response.ok === false 才记录日志
-  // 但 Token 失败时，fetch 跟随重定向，response.ok === true
-  if (!response.ok) {
-    console.error(...)  // 不会执行！
-  }
-})
-// 没有 .catch() 网络错误
+| 场景编号 | 前置条件 | 失败阶段 | 失败类型 | fetch 行为 | response.ok | 日志记录 | 可观测性 | 实际结果 |
+|---------|---------|---------|---------|-----------|------------|---------|---------|---------|
+| A1 | Token 未设置 | 启动期 | 环境变量缺失 | N/A (未启动) | N/A | ❌ 无（进程崩溃前） | ✅ 高（进程退出） | **快速失败** |
+| A2 | Token 为空字符串 | 启动期 | 环境变量验证失败 | N/A (未启动) | N/A | ❌ 无（进程崩溃前） | ✅ 高（进程退出） | **快速失败** |
+| B1 | Token 值不匹配 | 运行期 | Token 验证失败 | 跟随重定向 → YouTube 200 | ✅ true | ❌ 无日志 | ❌ 低（完全静默） | **静默失败** 🔥 |
+| B2 | Token 格式错误 (缺少 "Bearer ") | 运行期 | Token 验证失败 | 跟随重定向 → YouTube 200 | ✅ true | ❌ 无日志 | ❌ 低（完全静默） | **静默失败** 🔥 |
+| B3 | 请求到 Replica 实例 | 运行期 | 实例角色检查失败 | 不跟随重定向 (500) | ❌ false | ✅ console.error | ✅ 中（有日志） | **有日志的失败** |
+| B4 | 请求体格式错误 | 运行期 | Zod 验证失败 | 不跟随重定向 (400/500) | ❌ false | ✅ console.error | ✅ 中（有日志） | **有日志的失败** |
+| B5 | 网络分区/超时 | 运行期 | 网络错误 | Promise reject | N/A | ❌ 无 .catch() | ⚠️ 中 (Unhandled Rejection) | **静默失败** 🔥 |
+| B6 | DNS 解析失败 | 运行期 | 网络错误 | Promise reject | N/A | ❌ 无 .catch() | ⚠️ 中 (Unhandled Rejection) | **静默失败** 🔥 |
+
+##### 3.0.5.6 调用侧如何判别两类问题的观测信号
+
+**场景 A（启动期失败）的观测信号：**
+
+```
+可观测性：高
+├── 直接信号：
+│   ├── 容器/进程状态：CrashLoopBackOff 或 ExitCode != 0
+│   ├── 启动日志：明确的 "Invalid environment variables"
+│   ├── 环境变量验证失败的字段列表
+│   └── 堆栈跟踪指向 env.server.ts:init()
+│
+├── 间接信号：
+│   ├── 健康检查端点无响应
+│   ├── 负载均衡器持续剔除该实例
+│   └── 部署失败/回滚触发
+│
+└── 定位难度：低
+    └── 日志直接指出缺失的环境变量名
 ```
 
-**失败场景矩阵（调用侧可见性）：**
+**场景 B（运行期失败）的观测信号：**
 
-| 失败原因 | fetch 行为 | response.ok | 日志记录 | 实际结果 |
-|---------|-----------|------------|---------|---------|
-| Token 不匹配 | 跟随重定向 → YouTube 200 | ✅ true | ❌ 无日志 | **静默失败** 🔥 |
-| Token 缺失 (env 未设置) | 同上 | ✅ true | ❌ 无日志 | **静默失败** 🔥 |
-| Token 不完整 (Bearer 格式错) | 同上 | ✅ true | ❌ 无日志 | **静默失败** 🔥 |
-| 请求到 Replica | 500 Error | ❌ false | ✅ console.error | 有日志 |
-| 请求体验证失败 (Zod) | 400/500 Error | ❌ false | ✅ console.error | 有日志 |
-| 网络分区/超时 | Promise reject | N/A | ❌ 无 .catch() | **静默失败** 🔥 |
-| DNS 解析失败 | Promise reject | N/A | ❌ 无 .catch() | **静默失败** 🔥 |
+```
+可观测性：极低（几乎不可见）
+├── 直接信号：
+│   ├── ❌ 无错误日志
+│   ├── ❌ 无异常抛出
+│   ├── ❌ response.ok = true（误导）
+│   └── ⚠️ 可能通过 response.url 检测（包含 youtube.com）
+│
+├── 间接信号（需要推断）：
+│   ├── 缓存命中率逐渐下降
+│   ├── 外部 API 调用率异常升高
+│   ├── 响应时间逐渐变长
+│   ├── 特定实例的负载高于其他实例
+│   └── 最终可能触发限流或费用告警
+│
+└── 定位难度：极高
+    ├── 需要通过"症状"反推"病因"
+    ├── 容易误判为"性能问题"或"缓存策略问题"
+```
 
-##### 3.0.5.4 如何"修复"重定向检测
+**关键区别总结表：**
+
+| 维度 | 场景 A：Token 缺失 | 场景 B：Token 不匹配 |
+|-----|-----------------|-------------------|
+| **失败阶段** | 启动期 | 运行期 |
+| **应用状态** | 进程崩溃退出 | 进程正常运行 |
+| **可观测性** | 高（明确错误日志） | 极低（完全静默） |
+| **response.ok** | N/A | ✅ true（误导） |
+| **日志记录** | 启动失败日志 | ❌ 无日志 |
+| **定位难度** | 低（日志直接指出问题） | 极高（需要通过症状推断） |
+| **影响范围** | 实例级停机 | 功能级失效 |
+| **发现时机** | 立即（启动时） | 延迟（缓存过期后） |
+| **故障模式** | Fail Fast（快速失败） | Silent Failure（静默失败） |
+
+##### 3.0.5.7 如何"修复"重定向检测
 
 **方案 1：设置 redirect: 'manual' 或 'error'**
 
@@ -1076,12 +1223,132 @@ const metrics = {
 
 | 监控维度 | 现有状态 | 缺失项 | 优先级 |
 |---------|---------|--------|-------|
-| HTTP 失败 | ✅ console.error | 结构化字段 | 中 |
-| 网络失败 | ❌ 未捕获 | .catch() + Sentry | 高 |
+| Token 验证失败 | ❌ 完全静默 | 返回 401 + 日志 | 🔴 高 |
+| HTTP 4xx/5xx 失败 | ✅ console.error | 结构化字段 | 中 |
+| 网络失败 | ❌ 未捕获 | .catch() + Sentry | 🔴 高 |
 | 成功写入 | ❌ 无日志 | 可选采样日志 | 低 |
 | 延迟指标 | ❌ 无监控 | Histogram | 中 |
-| 失败率 | ❌ 无指标 | Counter + 告警 | 高 |
+| 失败率 | ❌ 无指标 | Counter + 告警 | 🔴 高 |
 | LiteFS 同步 | ❌ 无监控 | 需要 LiteFS 指标 | 中 |
+
+### 5.5 核心边界结论
+
+#### 5.5.1 最严重的静默失败点
+
+```
+🔴 致命缺陷：Token 验证失败导致完全静默
+
+根本原因：
+1. 服务端返回 redirect('youtube.com') → 302 Found
+2. Node.js fetch 默认 redirect: 'follow' → 自动跟随重定向
+3. YouTube 返回 200 OK → response.ok = true
+4. 调用侧只有 if (!response.ok) 才记录日志
+5. 结果：缓存写入失败，但没有任何迹象！
+
+影响链：
+env 变量不一致
+    ↓
+Token 验证失败
+    ↓
+重定向 → YouTube 200
+    ↓
+response.ok = true
+    ↓
+无日志记录
+    ↓
+缓存写入丢失
+    ↓
+缓存逐渐过期
+    ↓
+外部 API 调用激增
+    ↓
+可能触发限流或费用超支
+```
+
+#### 5.5.2 fetch 默认行为的反直觉陷阱
+
+| fetch 配置 | 3xx 响应行为 | response.ok | 调用侧检测 |
+|-----------|-------------|------------|----------|
+| `redirect: 'follow'` (默认) | 跟随到最终 URL | 取决于最终响应 | ❌ 无法检测重定向 |
+| `redirect: 'manual'` | 返回原始 3xx 响应 | false (3xx 非 2xx) | ✅ 可以检测 |
+| `redirect: 'error'` | Promise reject | N/A | ✅ 通过异常检测 |
+
+**当前代码使用默认值 `'follow'`，这是静默失败的根源。**
+
+#### 5.5.3 可观测性的三层边界
+
+```
+可观测性层级：
+├── 第一层：显式日志
+│   ├── HTTP 4xx/5xx → console.error ✅
+│   └── Token 失败 → 无日志 ❌
+│
+├── 第二层：Unhandled Rejection
+│   ├── 网络错误 → Node.js 警告 ⚠️
+│   └── Token 失败 → Promise resolve，无异常 ❌
+│
+└── 第三层：外部监控
+    ├── 缓存写入成功率 → 无指标 ❌
+    ├── Token 验证失败率 → 无指标 ❌
+    └── 只能通过"症状"间接推断：
+        ├── 外部 API 调用率异常
+        ├── 响应时间变长
+        └── 缓存命中率下降
+```
+
+#### 5.5.4 设计权衡的边界
+
+| 设计决策 | 优点 | 缺点 | 边界 |
+|---------|------|------|------|
+| `redirect(youtube)` | 迷惑外部攻击者 | 内部调用无法检测错误 | 🔴 内部 API 不应使用重定向 |
+| `void` 即发即忘 | 不阻塞主流程 | 丢失错误上下文 | ⚠️ 需要 .catch() |
+| `redirect: 'follow'` | 浏览器友好 | 隐藏了 3xx 状态 | ⚠️ 内部 API 调用应使用 'error' 或 'manual' |
+| `response.ok` 判定 | 简单直接 | 无法区分成功与"跟随重定向后的成功" | 🔴 需要额外检查 |
+
+#### 5.5.5 最小修复建议
+
+**不改变设计意图的最小修复：**
+
+```typescript
+// 方案 A：修改 fetch 配置（最小改动）
+return fetch(`${domain}/admin/cache/sqlite`, {
+  method: 'POST',
+  redirect: 'error',  // 3xx 响应直接 reject
+  headers: {
+    Authorization: `Bearer ${token}`,
+    'Content-Type': 'application/json',
+  },
+  body: JSON.stringify({ key, cacheValue }),
+})
+
+// 同时添加 .catch()
+void updatePrimaryCacheValue({...})
+  .then((response) => {
+    if (!response.ok) {
+      console.error(...)
+    }
+  })
+  .catch((error) => {
+    console.error('Cache update failed:', error)
+    // Sentry.captureException(error)
+  })
+```
+
+**更彻底的修复（推荐）：**
+
+```typescript
+// 服务端：内部 API 返回 401 而非重定向
+if (!isAuthorized) {
+  return new Response(JSON.stringify({ error: 'Unauthorized' }), {
+    status: 401,
+    headers: { 'Content-Type': 'application/json' },
+  })
+}
+// 如果需要迷惑外部攻击者，可以保留重定向但添加 header 检查：
+// if (request.headers.get('X-Internal-Call') !== 'true') {
+//   return redirect(...)
+// }
+```
 
 ## 6. 关键文件参考
 
