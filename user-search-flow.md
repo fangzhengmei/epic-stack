@@ -32,22 +32,22 @@ Epic Stack 使用 **React Router 7** 作为全栈框架，结合 **Prisma 6** �
 
 **关键技术点：**
 
-1. **GET 表单提交** (lines 31-34)
+1. **GET 表单提交** (`app/components/search-bar.tsx:31-35`)
    - 使用 React Router 的 `<Form>` 组件
    - 方法为 GET，搜索参数通过 URL 查询字符串传递
    - 目标路由为 `/users`
 
-2. **URL 状态同步** (lines 19, 45)
+2. **URL 状态同步** (`app/components/search-bar.tsx:19, 45`)
    - 使用 `useSearchParams()` 获取当前 URL 中的搜索参数
    - 通过 `defaultValue` 保持输入框与 URL 状态一致
    - 刷新页面或浏览器前进后退时保持搜索状态
 
-3. **防抖自动提交** (lines 26-28)
+3. **防抖自动提交** (`app/components/search-bar.tsx:26-28`)
    - 使用 `useDebounce` hook，延迟 400ms
    - 当 `autoSubmit` 为 true 时，输入变化后自动提交表单
    - 优化用户体验，减少不必要的请求
 
-4. **导航状态检测** (lines 21-24)
+4. **导航状态检测** (`app/components/search-bar.tsx:21-24`)
    - 使用 `useIsPending` 检测表单是否正在提交
    - 配合 `StatusButton` 显示加载状态
 
@@ -71,7 +71,7 @@ Epic Stack 使用 **React Router 7** 作为全栈框架，结合 **Prisma 6** �
 
 #### 3.2.1 清空搜索词重定向机制
 
-**核心逻辑** (`app/routes/users/index.tsx:77-80`)：
+**核心逻辑** (`app/routes/users/index.tsx:12-14`)：
 
 ```typescript
 const searchTerm = new URL(request.url).searchParams.get('search')
@@ -484,7 +484,7 @@ const users = await prisma.$queryRawTyped(searchUsers(like))
 
 | 需求 | Typed SQL | Query Builder | 原生 SQL | 验证依据 |
 |------|-----------|---------------|----------|---------|
-| 子查询排序 (ORDER BY) | ✅ 支持 | ❌ 不支持 | ✅ 支持 | `prisma/sql/searchUsers.sql:157-163` |
+| 子查询排序 (ORDER BY) | ✅ 支持 | ❌ 不支持 | ✅ 支持 | `prisma/sql/searchUsers.sql:12-18` |
 | 类型安全 | ✅ 有 | ✅ 有 | ❌ 无 | `@prisma/client/sql` 导入 |
 | 单个 JOIN 查询 | ✅ 是 | ❌ 可能多个 | ✅ 是 | `LEFT JOIN` 语句 |
 | SQL 独立文件 | ✅ 是 | ❌ 嵌入 TS | ⚠️ 可提取 | `prisma/sql/` 目录 |
