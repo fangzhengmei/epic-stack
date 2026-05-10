@@ -8,8 +8,16 @@
 5. [重定向后读取：Root Loader 获取消息](#5-重定向后读取root-loader-获取消息)
 6. [客户端展示：useToast Hook 与 Sonner](#6-客户端展示usetoast-hook-与-sonner)
 7. [响应头合并处理机制](#7-响应头合并处理机制)
+   - 7.1 [两层处理边界（核心澄清）](#71-两层处理边界核心澄清)
+   - 7.2 [第一层：应用层 - Set-Cookie 合并](#72-第一层应用层---set-cookie-合并)
+   - 7.3 [第二层：路由层 - pipeHeaders 管道透传](#73-第二层路由层---pipeheaders-管道透传)
+   - 7.4 [边界与优先级对照](#74-边界与优先级对照)
+   - 7.5 [端到端示例：登录成功 + Toast 提示](#75-端到端示例登录成功--toast-提示)
+   - 7.6 [关键事实总结](#76-关键事实总结)
 8. [完整流程示例](#8-完整流程示例)
 9. [关键代码位置](#9-关键代码位置)
+10. [设计亮点](#10-设计亮点)
+11. [与 redirect-cookie 的关系](#11-与-redirect-cookie-的关系)
 
 ---
 
@@ -402,10 +410,12 @@ Epic Stack 的响应头处理分为**两个完全独立的层次**，职责和�
 
 1. **Toast Cookie**: `en_toast` (消息)
 2. **Auth Cookie**: `en_session` (登录态)
-3. **Verify Cookie**: `en_verify` (2FA 验证态)
+3. **Verification Cookie**: `en_verification` (2FA 验证态 / 邮箱验证态)
 4. **Redirect Cookie**: `redirectTo` (清除重定向目标)
 
 如果使用 `headers.set('set-cookie', value)`，后面的值会覆盖前面的。
+
+> **说明**：Cookie 名称来自各会话存储的 `cookie.name` 配置。例如 `en_verification` 定义在 `app/utils/verification.server.ts` 第5行。
 
 #### 解决方案：`combineHeaders`
 
