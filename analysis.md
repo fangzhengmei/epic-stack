@@ -363,7 +363,305 @@ export async function action({ request }: Route.ActionArgs) {
 | 路径 B | Token 不匹配 | 3xx | Rickroll 重定向 | 无日志 |
 | 路径 C | 请求体格式错误 | 400/500 | Zod 错误 | 无专门日志 |
 
-#### 3.0.5 一致性影响分析
+#### 3.0.5 Token 缺失/不匹配时调用侧的实际可见结果
+
+##### 3.0.5.1 fetch 重定向行为分析
+
+**关键知识：** Node.js fetch 默认行为
+
+```
+Node.js fetch 默认配置 (redirect: 'follow')
+├── 3xx 响应时自动跟随重定向
+├── 重定向到外部 URL (youtube.com) 时：
+│   ├── 发起新请求
+│   ├── 跟随所有重定向链
+│   └── 返回最终页面的 Response
+└── response.ok 判定：
+    ├── 2xx → response.ok = true ✅
+    ├── 3xx (在最终响应前) → 已被 fetch 消费
+    └── 4xx/5xx → response.ok = false ❌
+```
+
+**Token 不匹配场景的实际流程：**
+
+```
+时间线：
+T0 Replica 发起 fetch (POST /admin/cache/sqlite)
+    │
+    ├── 请求到达 Primary 实例
+    │       ↓
+    ├── Token 验证失败 (isAuthorized = false)
+    │       ↓
+    ├── Primary 返回 302/303 重定向
+    │       ├── Location: https://www.youtube.com/watch?v=dQw4w9WgXcQ
+    │       └── 状态码：取决于 React Router redirect()
+    │
+    ├── fetch (redirect: 'follow' 默认)
+    │       ↓
+    ├── 自动跟随重定向到 youtube.com
+    │       ↓
+    ├── youtube.com 返回 200 OK (或其他 2xx)
+    │       ↓
+    └── fetch 返回的 Response：
+        ├── response.ok = true ✅
+        ├── response.status = 200
+        ├── response.statusText = 'OK'
+        └── response.body = YouTube 页面 HTML
+
+调用侧判定：
+.then((response) => {
+  if (!response.ok) {  // response.ok === true，不进入此分支
+    console.error(...)  // ❌ 不会执行！静默失败！
+  }
+})
+// 🔥 结果：缓存写入失败，但没有任何日志！
+```
+
+##### 3.0.5.2 React Router redirect() 的状态码
+
+```
+React Router redirect() 函数行为：
+├── redirect('url') → 默认 302 Found
+├── redirect('url', 301) → 301 Moved Permanently
+├── redirect('url', 303) → 303 See Other
+└── 响应头包含 Location
+```
+
+**代码位置**：`sqlite.server.ts:47`
+```typescript
+return redirect('https://www.youtube.com/watch?v=dQw4w9WgXcQ')
+// 默认返回 302 Found，包含 Location 头
+```
+
+##### 3.0.5.3 静默失败的完整证明
+
+**调用侧代码** (`cache.server.ts:166-176`)：
+```typescript
+void updatePrimaryCacheValue({
+  key,
+  cacheValue: entry,
+}).then((response) => {
+  // ⚠️ 致命问题：只有 response.ok === false 才记录日志
+  // 但 Token 失败时，fetch 跟随重定向，response.ok === true
+  if (!response.ok) {
+    console.error(...)  // 不会执行！
+  }
+})
+// 没有 .catch() 网络错误
+```
+
+**失败场景矩阵（调用侧可见性）：**
+
+| 失败原因 | fetch 行为 | response.ok | 日志记录 | 实际结果 |
+|---------|-----------|------------|---------|---------|
+| Token 不匹配 | 跟随重定向 → YouTube 200 | ✅ true | ❌ 无日志 | **静默失败** 🔥 |
+| Token 缺失 (env 未设置) | 同上 | ✅ true | ❌ 无日志 | **静默失败** 🔥 |
+| Token 不完整 (Bearer 格式错) | 同上 | ✅ true | ❌ 无日志 | **静默失败** 🔥 |
+| 请求到 Replica | 500 Error | ❌ false | ✅ console.error | 有日志 |
+| 请求体验证失败 (Zod) | 400/500 Error | ❌ false | ✅ console.error | 有日志 |
+| 网络分区/超时 | Promise reject | N/A | ❌ 无 .catch() | **静默失败** 🔥 |
+| DNS 解析失败 | Promise reject | N/A | ❌ 无 .catch() | **静默失败** 🔥 |
+
+##### 3.0.5.4 如何"修复"重定向检测
+
+**方案 1：设置 redirect: 'manual' 或 'error'**
+
+```typescript
+// 不跟随重定向，直接返回 3xx 响应
+return fetch(`${domain}/admin/cache/sqlite`, {
+  method: 'POST',
+  redirect: 'manual',  // 或 'error'
+  headers: {
+    Authorization: `Bearer ${token}`,
+    'Content-Type': 'application/json',
+  },
+  body: JSON.stringify({ key, cacheValue }),
+})
+
+// 此时：
+// Token 失败 → response.status = 302
+// response.ok = false (302 不在 200-299)
+// if (!response.ok) 分支会执行 ✅
+```
+
+**方案 2：检查响应内容类型或 URL**
+
+```typescript
+// 跟随重定向后检查最终 URL
+.then((response) => {
+  const finalUrl = response.url
+  if (finalUrl.includes('youtube.com')) {
+    console.error('Token validation failed, redirected to YouTube')
+  }
+  if (!response.ok) {
+    console.error(...)
+  }
+})
+```
+
+**方案 3：服务器端返回 401 而非重定向**
+
+```typescript
+// 当前 (sqlite.server.ts:47)
+return redirect('https://www.youtube.com/watch?v=dQw4w9WgXcQ')
+
+// 建议：内部 API 应该返回 401 Unauthorized
+if (!isAuthorized) {
+  return new Response(JSON.stringify({ error: 'Unauthorized' }), {
+    status: 401,
+    headers: { 'Content-Type': 'application/json' },
+  })
+}
+// 此时 response.status = 401, response.ok = false
+// 日志会正确记录 ✅
+```
+
+#### 3.0.6 无 .catch 场景下的错误可观测性缺口
+
+##### 3.0.6.1 void Promise 的风险
+
+```typescript
+// 当前代码 (cache.server.ts:166)
+void updatePrimaryCacheValue({...})
+  .then((response) => {
+    if (!response.ok) console.error(...)
+  })
+// ❌ 没有 .catch()
+```
+
+**void 关键字的作用：**
+- 显式表示"忽略 Promise 返回值"
+- 不等待 Promise 完成
+- 不阻塞主流程
+
+**风险：**
+
+| Promise 状态 | 结果 | 可观测性 |
+|------------|------|---------|
+| resolve (response.ok = true) | 正常或静默失败 | ❌ 无日志 |
+| resolve (response.ok = false) | 记录 console.error | ✅ 有日志 |
+| reject (网络错误等) | Unhandled Promise Rejection | ⚠️ 取决于 Node.js 配置 |
+
+##### 3.0.6.2 Unhandled Promise Rejection 的实际行为
+
+**Node.js 默认行为 (版本 22.x)：**
+
+```
+Unhandled Promise Rejection 触发时：
+├── 输出警告到 stderr
+├── 格式：
+│   ├── (node:12345) UnhandledPromiseRejectionWarning
+│   ├── (node:12345) [DEP0018] DeprecationWarning
+│   └── Stack trace
+├── 进程默认行为：
+│   ├── Node.js 15+：进程退出 (exit code 1)
+│   └── 旧版本：继续运行，但有警告
+└── 问题：
+    ├── 日志格式不统一
+    ├── 没有上下文信息 (cache key, primary instance)
+    └── Sentry 可能不会捕获 (取决于集成)
+```
+
+##### 3.0.6.3 可观测性缺口矩阵
+
+| 错误类型 | 触发场景 | console.error | Sentry 捕获 | 进程影响 |
+|---------|---------|--------------|------------|---------|
+| Token 不匹配 | env 变量不一致 | ❌ 无 | ❌ 无 | 无 |
+| Token 缺失 | INTERNAL_COMMAND_TOKEN 未设置 | ❌ 无 | ❌ 无 | 无 |
+| 网络分区 | Primary 不可达 | ❌ 无 | ⚠️ 可能 | 可能退出 |
+| DNS 失败 | 内部域名解析失败 | ❌ 无 | ⚠️ 可能 | 可能退出 |
+| TLS 握手失败 | 证书问题 | ❌ 无 | ⚠️ 可能 | 可能退出 |
+| 连接超时 | 慢网络或负载高 | ❌ 无 | ⚠️ 可能 | 可能退出 |
+| HTTP 4xx/5xx | 服务器返回错误 | ✅ 有 | ❌ 无 | 无 |
+
+##### 3.0.6.4 最危险的场景：Token 不一致
+
+**场景描述：**
+
+```
+假设：
+├── Replica A: INTERNAL_COMMAND_TOKEN = "token-a"
+├── Replica B: INTERNAL_COMMAND_TOKEN = "token-b"  ⚠️ 错误！
+└── Primary:   INTERNAL_COMMAND_TOKEN = "token-a"
+
+结果：
+├── Replica A 写入 → Token 匹配 → 正常工作
+├── Replica B 写入 → Token 不匹配 → 重定向到 YouTube
+│       ├── fetch 跟随重定向
+│       ├── response.ok = true
+│       ├── 无日志
+│       └── 缓存写入丢失
+└── 影响范围：
+    ├── Replica B 的所有 cache.set/delete 都失败
+    ├── 没有任何错误迹象
+    ├── 缓存逐渐过期
+    └── 最后导致缓存雪崩
+```
+
+**检测难度：**
+
+```
+如何发现这个问题？
+├── 用户侧：可能只是觉得"应用变慢了"
+├── 监控侧：
+│   ├── 没有专门的缓存写入成功率指标
+│   ├── 没有 Token 验证失败日志
+│   └── 可能在很久后才发现外部 API 调用率异常
+└── 日志侧：
+    ├── 没有 console.error
+    ├── 可能有 Unhandled Rejection（如果是网络问题）
+    └── 但 Token 问题完全静默
+```
+
+#### 3.0.7 边界结论
+
+##### 3.0.7.1 静默失败边界
+
+| 静默失败类型 | 触发条件 | 可见性 | 风险等级 |
+|-------------|---------|--------|---------|
+| Token 不匹配 | env 变量不一致 | ❌ 完全不可见 | 🔴 高 |
+| Token 缺失 | INTERNAL_COMMAND_TOKEN 未设置 | ❌ 完全不可见 | 🔴 高 |
+| 网络分区 | Primary 不可达 | ⚠️ 部分可见 (Unhandled Rejection) | 🟠 中 |
+| 同步延迟 | LiteFS 复制滞后 | ❌ 不可检测 | 🟡 低 |
+
+##### 3.0.7.2 可观测性边界
+
+**当前可观测性覆盖：**
+
+```
+✅ 已覆盖：
+├── HTTP 4xx/5xx 响应 → console.error
+└── Unhandled Rejection → Node.js 警告 (可能退出)
+
+❌ 未覆盖：
+├── Token 验证失败 (重定向后 response.ok = true)
+├── 成功写入 (可选采样日志)
+├── 缓存写入延迟/耗时
+├── 缓存写入成功率指标
+├── 结构化日志字段
+└── Sentry 事件捕获
+```
+
+##### 3.0.7.3 设计意图 vs 实际行为
+
+| 设计意图 | 实际行为 | 偏差 |
+|---------|---------|------|
+| Token 失败时迷惑攻击者 (Rickroll) | 同时迷惑了自己的监控 | ⚠️ 安全/可观测性权衡 |
+| fire-and-forget 不阻塞主流程 | 同时丢失了错误检测 | ⚠️ 性能/可靠性权衡 |
+| redirect() 是防御性迷惑 | fetch 跟随重定向破坏了检测 | 🔴 严重缺陷 |
+
+##### 3.0.7.4 修复优先级建议
+
+| 优先级 | 问题 | 修复方案 | 影响范围 |
+|-------|------|---------|---------|
+| 🔴 P0 | Token 失败静默 | 内部 API 返回 401 而非重定向 | 所有副本写入 |
+| 🔴 P0 | 无 .catch() | 添加 .catch() + Sentry | 网络错误 |
+| 🟠 P1 | 无超时 | 添加 fetch timeout | 所有请求 |
+| 🟠 P1 | 无重试 | 添加指数退避重试 | 临时故障 |
+| 🟡 P2 | 无指标 | 添加计数器/直方图 | 监控告警 |
+| 🟡 P2 | 无结构化日志 | 使用 pino/winston | 日志聚合 |
+
+#### 3.0.8 一致性影响分析
 
 **缓存一致性模型：最终一致 (Eventual Consistency)**
 
@@ -739,7 +1037,53 @@ const metrics = {
 | 图片来源边界 | allowlistedOrigins | SSRF 防护 |
 | 敏感数据边界 | password: false | 明确排除敏感字段 |
 
-## 5. 关键文件参考
+## 5. 深度分析总结
+
+### 5.1 副本实例写入失败路径总结
+
+| 失败类型 | 触发条件 | 写入结果 | 可观测性 | 缓解建议 |
+|---------|---------|---------|---------|---------|
+| 网络错误 | 主实例不可达 | 完全丢失 | ❌ 无捕获 | 添加 .catch() + Sentry |
+| HTTP 错误 | 4xx/5xx 响应 | 完全丢失 | ✅ console.error | 重试机制 |
+| 同步延迟 | LiteFS 复制滞后 | Primary 成功 | ❌ 无法检测 | 可接受最终一致 |
+| 进程崩溃 | 主实例崩溃 | 不确定 | ❌ 难以追踪 | 分布式事务/队列 |
+
+### 5.2 内部 API 未授权分支行为
+
+| 路径 | 防御检查 | HTTP 状态 | 响应内容 | 设计意图 |
+|------|---------|-----------|---------|---------|
+| 路径 A | 实例角色检查 | 500 | Error 消息 | 防止错误路由 |
+| 路径 B | Token 验证 | 3xx | Rickroll 重定向 | 迷惑攻击者 |
+| 路径 C | Zod 验证 | 400/500 | Zod 错误 | 请求体验证 |
+
+### 5.3 一致性模型分析
+
+```
+一致性级别：最终一致 (Eventual Consistency)
+├── 正常延迟：毫秒级 (LiteFS 复制)
+├── 失败恢复：TTL/SWR 自动刷新
+├── 风险点：
+│   ├── 大量写入失败 → 缓存雪崩
+│   ├── 外部 API 限流 → 刷新失败
+│   └── 长 TTL + 无重试 → 长期不一致
+└── 缓解措施：
+    ├── 合理设置 TTL (如 60s)
+    ├── 使用 SWR 容忍过期值
+    └── 缓存写入失败重试机制
+```
+
+### 5.4 可观测性矩阵
+
+| 监控维度 | 现有状态 | 缺失项 | 优先级 |
+|---------|---------|--------|-------|
+| HTTP 失败 | ✅ console.error | 结构化字段 | 中 |
+| 网络失败 | ❌ 未捕获 | .catch() + Sentry | 高 |
+| 成功写入 | ❌ 无日志 | 可选采样日志 | 低 |
+| 延迟指标 | ❌ 无监控 | Histogram | 中 |
+| 失败率 | ❌ 无指标 | Counter + 告警 | 高 |
+| LiteFS 同步 | ❌ 无监控 | 需要 LiteFS 指标 | 中 |
+
+## 6. 关键文件参考
 
 - 资源路由：
   - `app/routes/resources/images.tsx` - 图片处理
