@@ -361,7 +361,42 @@ const EpicToaster = ({ theme, ...props }: ToasterProps) => {
 
 ## 7. 响应头合并处理机制
 
-### 7.1 问题背景
+### 7.1 两层处理边界（核心澄清）
+
+Epic Stack 的响应头处理分为**两个完全独立的层次**，职责和作用范围截然不同：
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  第一层：应用层 - Action/Loader 内的 Set-Cookie 合并                  │
+│  ─────────────────────────────────────────────────────────────────  │
+│  工具函数：combineHeaders / combineResponseInits                     │
+│  触发时机：Action/Loader 执行过程中（开发者手动调用）                   │
+│  处理的头：任意头（开发者决定），核心用途是 Set-Cookie                  │
+│  关键技术：Headers.append() 防止同名头相互覆盖                        │
+│  影响范围：单个 Action/Loader 返回的 Response 对象                    │
+└─────────────────────────────────────────────────────────────────────┘
+                                    ↓
+┌─────────────────────────────────────────────────────────────────────┐
+│  第二层：路由层 - Headers 函数的管道透传                              │
+│  ─────────────────────────────────────────────────────────────────  │
+│  工具函数：pipeHeaders                                               │
+│  触发时机：Loader/Action 执行完成后（React Router 框架调用）           │
+│  处理的头：仅白名单 3 个（Cache-Control, Vary, Server-Timing）         │
+│  ⚠️ 关键澄清：Set-Cookie 不在此层处理！由 React Router 自动收集         │
+│  影响范围：父子路由间的头继承策略                                      │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+**关键事实澄清：**
+- `Set-Cookie` 的合并发生在 `redirectWithToast` → `combineHeaders` 这一层
+- `pipeHeaders` 只处理 `Cache-Control`, `Vary`, `Server-Timing` 的透传与继承
+- 两层机制在执行时机、作用范围、处理逻辑上完全独立
+
+---
+
+### 7.2 第一层：应用层 - Set-Cookie 合并
+
+#### 问题背景
 
 一个重定向响应可能需要同时设置多个 Cookie：
 
@@ -370,11 +405,9 @@ const EpicToaster = ({ theme, ...props }: ToasterProps) => {
 3. **Verify Cookie**: `en_verify` (2FA 验证态)
 4. **Redirect Cookie**: `redirectTo` (清除重定向目标)
 
-如果简单使用 `headers.set('set-cookie', value)`，后面的值会覆盖前面的。
+如果使用 `headers.set('set-cookie', value)`，后面的值会覆盖前面的。
 
-### 7.2 解决方案：三级合并机制
-
-#### 第一级：`combineHeaders` (函数级)
+#### 解决方案：`combineHeaders`
 
 ```typescript
 // app/utils/misc.tsx:107-118
@@ -392,9 +425,9 @@ export function combineHeaders(
 }
 ```
 
-**关键点**：使用 `Headers.append()` 而非 `Headers.set()`，允许多个同名头。
+**核心机制：** 使用 `Headers.append()` 而非 `Headers.set()`，允许多个同名头共存。
 
-#### 第二级：`combineResponseInits` (对象级)
+#### 增强版：`combineResponseInits`
 
 ```typescript
 // app/utils/misc.tsx:123-134
@@ -412,9 +445,97 @@ export function combineResponseInits(
 }
 ```
 
-合并整个 `ResponseInit` 对象（status, statusText, headers 等）。
+合并整个 `ResponseInit` 对象（status, statusText, headers 等），用于更复杂的响应构建场景。
 
-#### 第三级：`pipeHeaders` (路由级)
+#### 实际应用：`redirectWithToast` 内部
+
+```typescript
+// app/utils/toast.server.ts:29-38
+export async function redirectWithToast(
+	url: string,
+	toast: ToastInput,
+	init?: ResponseInit,
+) {
+	return redirect(url, {
+		...init,
+		headers: combineHeaders(init?.headers, await createToastHeaders(toast)),
+	})
+}
+```
+
+**Set-Cookie 合并过程详解：**
+```
+用户传入 init.headers:
+  { 'set-cookie': 'redirectTo=; Max-Age=-1' }
+                          ↓
+createToastHeaders(toast) 生成:
+  { 'set-cookie': 'en_toast=eyJ...; Path=/; HttpOnly' }
+                          ↓
+combineHeaders(init?.headers, toastHeaders)
+  → 使用 append() 而非 set()
+                          ↓
+最终结果（两个 Set-Cookie 独立存在）:
+  Set-Cookie: redirectTo=; Max-Age=-1
+  Set-Cookie: en_toast=eyJ...; Path=/; HttpOnly
+```
+
+---
+
+### 7.3 第二层：路由层 - pipeHeaders 管道透传
+
+#### 触发时机
+
+当路由导出 `headers` 函数时，React Router 在响应构建阶段调用它：
+
+```typescript
+// app/root.tsx:135
+export const headers: Route.HeadersFunction = pipeHeaders
+
+// app/routes/settings/profile/connections.tsx:88
+export const headers: Route.HeadersFunction = pipeHeaders
+```
+
+#### 源码逻辑（头选择部分）
+
+```typescript
+// app/utils/headers.server.ts:12-28
+export function pipeHeaders({
+	parentHeaders,
+	loaderHeaders,
+	actionHeaders,
+	errorHeaders,
+}: HeadersArgs) {
+	const headers = new Headers()
+
+	// get the one that's actually in use
+	let currentHeaders: Headers
+	if (errorHeaders !== undefined) {
+		currentHeaders = errorHeaders
+	} else if (loaderHeaders.entries().next().done) {
+		currentHeaders = actionHeaders
+	} else {
+		currentHeaders = loaderHeaders
+	}
+	// ... 后续处理白名单头
+}
+```
+
+#### 头选择优先级（按源码校准）
+
+```
+优先级：errorHeaders > (loaderHeaders 为空 ? actionHeaders : loaderHeaders)
+
+判断逻辑：
+1. 有 errorHeaders → 用 errorHeaders
+2. 否则 loaderHeaders 为空（entries().next().done）→ 用 actionHeaders
+3. 否则 → 用 loaderHeaders
+
+注意：不是简单的 loader > action，而是 loader 为空才回退 action
+```
+
+**源码依据**：`loaderHeaders.entries().next().done` 判断 Headers 是否为空
+
+#### 完整处理流程
 
 ```typescript
 // app/utils/headers.server.ts:12-70
@@ -426,30 +547,39 @@ export function pipeHeaders({
 }: HeadersArgs) {
 	const headers = new Headers()
 
-	// 1. 确定当前使用的 headers (error > loader > action)
-	let currentHeaders = errorHeaders ?? loaderHeaders ?? actionHeaders
+	// 步骤 1：选择当前路由的主要 headers 源
+	// 优先级：error > (loader 为空 ? action : loader)
+	let currentHeaders: Headers
+	if (errorHeaders !== undefined) {
+		currentHeaders = errorHeaders
+	} else if (loaderHeaders.entries().next().done) {
+		currentHeaders = actionHeaders
+	} else {
+		currentHeaders = loaderHeaders
+	}
 
-	// 2. 转发特定头 (Cache-Control, Vary, Server-Timing)
+	// 步骤 2：从 currentHeaders 提取白名单头
+	// 只处理：Cache-Control, Vary, Server-Timing
 	const forwardHeaders = ['Cache-Control', 'Vary', 'Server-Timing']
 	for (const headerName of forwardHeaders) {
 		const header = currentHeaders.get(headerName)
 		if (header) headers.set(headerName, header)
 	}
 
-	// 3. 合并保守 Cache-Control
+	// 步骤 3：Cache-Control 特殊处理：取最保守值
 	headers.set('Cache-Control', getConservativeCacheControl(
 		parentHeaders.get('Cache-Control'),
 		headers.get('Cache-Control'),
 	))
 
-	// 4. 继承父级特定头 (Vary, Server-Timing) - 使用 append
+	// 步骤 4：父子路由合并：Vary 和 Server-Timing 使用 append 累加
 	const inheritHeaders = ['Vary', 'Server-Timing']
 	for (const headerName of inheritHeaders) {
 		const header = parentHeaders.get(headerName)
 		if (header) headers.append(headerName, header)
 	}
 
-	// 5. 回退到父级头
+	// 步骤 5：回退机制：子路由没有则继承父路由
 	const fallbackHeaders = ['Cache-Control', 'Vary']
 	for (const headerName of fallbackHeaders) {
 		if (!headers.has(headerName)) {
@@ -462,43 +592,278 @@ export function pipeHeaders({
 }
 ```
 
-**优先级策略：**
-- **Error Headers**: 最高优先级（错误页面）
-- **Loader Headers**: 次高（页面数据）
-- **Action Headers**: 次低（表单提交）
-- **Parent Headers**: 最低（从父路由继承）
+#### 白名单策略（关键）
 
-### 7.3 复杂场景示例
+| Header 名称 | 处理方式 | 说明 |
+|------------|---------|------|
+| `Cache-Control` | `set` + 保守值合并 | 父子路由取最严格策略 |
+| `Vary` | `append` + fallback | 累加所有 Vary 条件 |
+| `Server-Timing` | `append` | 累加性能指标 |
+| `Set-Cookie` | **不处理** | 由 React Router 自动收集 |
+| 其他头 | **不处理** | 不在透传范围内 |
 
-OAuth 回调页面同时处理 4 种 Cookie：
+#### 执行流程图
 
+```
+HTTP 请求到达
+        ↓
+┌─────────────────────────────────────┐
+│  React Router 执行路由匹配            │
+└─────────────────────────────────────┘
+        ↓
+┌─────────────────────────────────────┐
+│  执行 Action（如果是 POST）           │
+│  action() 返回 Response             │
+│  → 包含 Set-Cookie: en_session      │
+│  → 包含 Set-Cookie: en_toast        │
+│  → 包含 Cache-Control: ...          │
+│  → 包含 Server-Timing: ...          │
+└─────────────────────────────────────┘
+        ↓
+┌─────────────────────────────────────┐
+│  执行 Loader                         │
+│  loader() 返回 Response             │
+│  → 包含 Set-Cookie: en_toast (销毁)  │
+│  → 包含 Server-Timing: ...          │
+│  → 包含 Cache-Control: ...          │
+└─────────────────────────────────────┘
+        ↓
+┌─────────────────────────────────────┐
+│  ⚠️  React Router 自动收集 Set-Cookie │
+│  （不经过 pipeHeaders）              │
+│  所有 Set-Cookie 被收集到最终响应     │
+└─────────────────────────────────────┘
+        ↓
+┌─────────────────────────────────────┐
+│  调用路由 headers 函数               │
+│  pipeHeaders({                      │
+│    parentHeaders,                   │
+│    loaderHeaders,                   │
+│    actionHeaders,                   │
+│  })                                 │
+│  → 只处理白名单头                    │
+│  → Set-Cookie 不参与此逻辑           │
+└─────────────────────────────────────┘
+        ↓
+┌─────────────────────────────────────┐
+│  entry.server.ts 最终组装响应         │
+│  handleRequest()                    │
+│  → 添加 fly-region 等基础设施头      │
+│  → 添加 CSP 安全头                   │
+│  → 合并所有 Set-Cookie（框架已收集）  │
+└─────────────────────────────────────┘
+        ↓
+HTTP 响应发送
+```
+
+---
+
+### 7.4 边界与优先级对照
+
+#### 7.4.1 两层机制对比表
+
+| 维度 | 第一层：应用层 | 第二层：路由层 |
+|------|--------------|--------------|
+| **工具函数** | `combineHeaders` / `combineResponseInits` | `pipeHeaders` |
+| **代码位置** | `app/utils/misc.tsx` | `app/utils/headers.server.ts` |
+| **层次** | 应用层（开发者手动调用） | 路由层（框架调用） |
+| **触发时机** | Action/Loader 执行中 | Loader/Action 执行后 |
+| **核心职责** | 手动合并多个响应头对象 | 父子路由头继承策略 |
+| **处理的头** | 任意头（开发者决定） | 仅白名单 3 个头 |
+| **Set-Cookie** | ✅ 核心用途 | ❌ 不处理 |
+| **调用方式** | 开发者手动调用 | 路由导出 headers 函数 |
+| **实现方式** | `Headers.append()` | `set` + 条件 `append` + `fallback` |
+
+#### 7.4.2 pipeHeaders 头选择优先级（按源码校准）
+
+| 场景 | errorHeaders | loaderHeaders | actionHeaders | 选择结果 |
+|------|-------------|---------------|---------------|---------|
+| 错误页面 | ✅ 定义 | 任意 | 任意 | errorHeaders |
+| 正常 GET | ❌ undefined | ✅ 非空 | ❌ 空 | loaderHeaders |
+| POST 且 loader 无返回头 | ❌ undefined | ❌ 空（.done === true） | ✅ 非空 | actionHeaders |
+| POST 且 loader 有返回头 | ❌ undefined | ✅ 非空 | ✅ 非空 | loaderHeaders |
+
+**源码判断逻辑：**
 ```typescript
-// app/routes/_auth/auth.$provider/callback.ts:55-65
-if (!authResult.success) {
-	throw await redirectWithToast(
-		'/login',
-		{
-			title: 'Auth Failed',
-			description: `There was an error authenticating with ${label}.`,
-			type: 'error',
-		},
-		{ headers: destroyRedirectTo },  // ← 额外的 Set-Cookie
-	)
+// app/utils/headers.server.ts:21-28
+let currentHeaders: Headers
+if (errorHeaders !== undefined) {
+	currentHeaders = errorHeaders
+} else if (loaderHeaders.entries().next().done) {
+	// loaderHeaders 为空（迭代器第一个元素就 done）
+	currentHeaders = actionHeaders
+} else {
+	currentHeaders = loaderHeaders
 }
 ```
 
-**合并过程**（在 `redirectWithToast` 内部）：
+#### 7.4.3 父子路由头继承策略
+
+| Header | 子路由有 | 子路由无 | 处理方式 |
+|--------|---------|---------|---------|
+| `Cache-Control` | 取保守值（max-age 取小） | 继承父路由 | `getConservativeCacheControl()` |
+| `Vary` | 累加（append） | 继承父路由 | 子路由 + 父路由 append |
+| `Server-Timing` | 累加（append） | 不继承 | 始终 append 父路由的值 |
+
+---
+
+### 7.5 端到端示例：登录成功 + Toast 提示
+
+#### 场景描述
+
+用户登录成功后：
+1. 设置登录态 Cookie (`en_session`)
+2. 设置 Toast 消息 Cookie (`en_toast`)
+3. 重定向到首页
+4. 首页读取 Toast 并显示
+
+#### 步骤 1：登录 Action 设置多个 Cookie
+
+```typescript
+// app/routes/_auth/login.server.ts:67-80
+return redirect(
+	safeRedirect(redirectTo),
+	combineResponseInits(
+		{
+			headers: {
+				// Auth Cookie
+				'set-cookie': await authSessionStorage.commitSession(authSession, {
+					expires: remember ? session.expirationDate : undefined,
+				}),
+			},
+		},
+		// 如果有 Toast，这里会再 combineHeaders
+		responseInit,
+	),
+)
 ```
-init.headers (用户传入) = { 'set-cookie': 'redirectTo=; Max-Age=-1' }
-                                                ↓
-createToastHeaders(toast) = { 'set-cookie': 'en_toast=eyJ...' }
-                                                ↓
-combineHeaders(init?.headers, toastHeaders)
-                                                ↓
-结果 Headers 包含两个 Set-Cookie:
-  1. Set-Cookie: redirectTo=; Max-Age=-1
-  2. Set-Cookie: en_toast=eyJ...; Path=/; HttpOnly; ...
+
+#### 步骤 2：如果是 OAuth 回调，会同时设置 Toast
+
+```typescript
+// app/routes/_auth/auth.$provider/callback.ts:113-121
+return redirectWithToast(
+	'/settings/profile/connections',
+	{
+		title: 'Connected',
+		type: 'success',
+		description: `Your "${profile.username}" ${label} account has been connected.`,
+	},
+	{ headers: destroyRedirectTo },  // 清除 redirectTo cookie
+)
 ```
+
+**此时响应头包含：**
+```
+HTTP/1.1 302 Found
+Location: /settings/profile/connections
+Set-Cookie: redirectTo=; Max-Age=-1
+Set-Cookie: en_toast=eyJ0b2FzdCI6eyJ0eXBlIjoic3VjY2VzcyIs...; Path=/; HttpOnly
+Set-Cookie: en_session=eyJzZXNzaW9uSWQiOiJjbHg4...; Path=/; HttpOnly
+Cache-Control: no-store, must-revalidate
+Server-Timing: auth;dur=123.45
+```
+
+**⚠️ 关键：** 这三个 `Set-Cookie` 是在 `redirectWithToast` → `combineHeaders` 这一层合并的，**不经过** `pipeHeaders`。
+
+#### 步骤 3：重定向到目标页面
+
+```
+GET /settings/profile/connections
+Cookie: en_toast=eyJ0b2FzdCI6eyJ0eXBlIjoic3VjY2VzcyIs...
+Cookie: en_session=eyJzZXNzaW9uSWQiOiJjbHg4...
+```
+
+#### 步骤 4：Root Loader 读取 Toast 并销毁
+
+```typescript
+// app/root.tsx:108-130
+const { toast, headers: toastHeaders } = await getToast(request)
+// toast = {
+//   id: 'clx8abc...',
+//   type: 'success',
+//   title: 'Connected',
+//   description: 'Your "kody" GitHub account has been connected.'
+// }
+
+return data(
+	{ user, toast, ... },
+	{
+		headers: combineHeaders(
+			{ 'Server-Timing': timings.toString() },
+			toastHeaders,  // Set-Cookie: en_toast=; Expires=1970...
+		),
+	},
+)
+```
+
+**此时 Loader 返回的响应头：**
+```
+Set-Cookie: en_toast=; Path=/; Expires=Thu, 01 Jan 1970 00:00:00 GMT
+Server-Timing: root;dur=45.67
+Cache-Control: public, max-age=60
+```
+
+#### 步骤 5：pipeHeaders 处理白名单头
+
+```typescript
+// 假设父路由 root 返回：
+parentHeaders = {
+	'Cache-Control': 'public, max-age=60',
+	'Server-Timing': 'root;dur=45.67',
+}
+
+// 子路由 connections 的 loader 返回：
+loaderHeaders = {
+	'Cache-Control': 'private, max-age=0',
+	'Server-Timing': 'connections;dur=12.34',
+}
+
+// pipeHeaders 处理后：
+headers = {
+	// Cache-Control：取保守值（max-age=0）
+	'Cache-Control': 'private, max-age=0',
+	// Server-Timing：append 累加
+	'Server-Timing': 'connections;dur=12.34, root;dur=45.67',
+}
+```
+
+**⚠️ 关键：** `Set-Cookie: en_toast=; Expires=...` **不参与** `pipeHeaders` 的处理，由 React Router 直接收集到最终响应。
+
+#### 步骤 6：最终发送给浏览器的响应
+
+```
+HTTP/1.1 200 OK
+Content-Type: text/html
+Cache-Control: private, max-age=0
+Server-Timing: connections;dur=12.34, root;dur=45.67
+Set-Cookie: en_toast=; Path=/; Expires=Thu, 01 Jan 1970 00:00:00 GMT
+fly-region: sjc
+fly-app: epic-notes
+```
+
+#### 步骤 7：客户端展示
+
+```typescript
+// app/root.tsx:195
+useToast(data.toast)
+// → useEffect 触发
+// → setTimeout(..., 0) 推入宏任务队列
+// → 渲染完成后执行
+// → toast.success('Connected', { description: '...' })
+```
+
+---
+
+### 7.6 关键事实总结
+
+| 问题 | 答案 |
+|------|------|
+| Set-Cookie 合并发生在哪一层？ | **应用层**：`redirectWithToast` → `combineHeaders` |
+| pipeHeaders 处理 Set-Cookie 吗？ | **不处理**，只处理白名单 3 个头 |
+| pipeHeaders 的头选择优先级？ | `error > (loader 为空 ? action : loader)` |
+| loader 和 action 都有头时用哪个？ | **用 loader**，只有 loader 为空才回退 action |
+| React Router 何时收集 Set-Cookie？ | Loader/Action 执行后，调用 headers 函数**之前** |
 
 ---
 
@@ -573,17 +938,26 @@ useToast(data.toast)
 
 ## 9. 关键代码位置
 
+### 9.1 核心文件索引
+
 | 文件 | 位置 | 职责 |
 |------|------|------|
-| `app/utils/toast.server.ts` | 第 1-62 行 | Toast 服务端核心逻辑 |
-| `app/utils/misc.tsx` | 第 107-134 行 | `combineHeaders`, `combineResponseInits` |
-| `app/utils/headers.server.ts` | 第 12-70 行 | `pipeHeaders` 路由头合并 |
-| `app/components/toaster.tsx` | 第 1-16 行 | `useToast` Hook |
-| `app/components/ui/sonner.tsx` | 第 1-26 行 | `EpicToaster` 组件 |
-| `app/root.tsx` | 第 71-133 行, 第 188-235 行 | Root Loader 读取 + 组件集成 |
-| `app/routes/users/$username/notes/$noteId.tsx` | 第 85-89 行 | 使用示例（重定向） |
-| `app/routes/settings/profile/connections.tsx` | 第 109-113 行 | 使用示例（不重定向） |
-| `app/routes/_auth/auth.$provider/callback.ts` | 第 55-65 行 | 复杂合并示例 |
+| `app/utils/toast.server.ts` | 第 1-62 行 | Toast 服务端核心逻辑（创建 + 读取 + 销毁） |
+| `app/utils/misc.tsx` | 第 107-134 行 | 第一层：`combineHeaders`, `combineResponseInits`（应用层合并） |
+| `app/utils/headers.server.ts` | 第 12-70 行 | 第二层：`pipeHeaders`（路由层透传，白名单策略） |
+| `app/components/toaster.tsx` | 第 1-16 行 | `useToast` Hook（`setTimeout(0)` 精确时序控制） |
+| `app/components/ui/sonner.tsx` | 第 1-26 行 | `EpicToaster` 组件（Sonner 样式封装） |
+| `app/root.tsx` | 第 71-133 行, 第 188-235 行 | Root Loader 读取 + 组件集成（全局入口） |
+| `app/entry.server.tsx` | 第 29-113 行 | 最终响应组装（React Router 已收集所有 Set-Cookie） |
+
+### 9.2 使用示例索引
+
+| 场景 | 文件 | 位置 |
+|------|------|------|
+| 重定向 + Toast | `app/routes/users/$username/notes/$noteId.tsx` | 第 85-89 行 |
+| 不重定向 + Toast（纯 JSON） | `app/routes/settings/profile/connections.tsx` | 第 109-113 行 |
+| 复杂多 Cookie 合并（OAuth 回调） | `app/routes/_auth/auth.$provider/callback.ts` | 第 55-65 行 |
+| 路由层 headers 管道 | `app/routes/settings/profile/connections.tsx` | 第 88 行 |
 
 ---
 
