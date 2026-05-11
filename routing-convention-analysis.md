@@ -1,54 +1,74 @@
 # Epic Stack 路由约定分析报告
 
-## 目录
-
-1. [概述](#概述)
-2. [路由自动生成机制](#路由自动生成机制)
-3. [文件命名与路径映射约定](#文件命名与路径映射约定)
-4. [路由模块共置约定](#路由模块共置约定)
-5. [特殊文件约定](#特殊文件约定)
-6. [配置与忽略规则](#配置与忽略规则)
-7. [实际项目示例分析](#实际项目示例分析)
+> 基于当前仓库真实配置与目录结构分析
 
 ---
 
-## 概述
+## 一、路由生成链路
 
-Epic Stack 使用 **基于文件系统的路由**（File-based Routing），通过 `react-router-auto-routes` 库自动从 `app/routes/` 目录生成路由配置。这种方式兼具：
-- 代码与路由的共置能力
-- 清晰的文件夹组织结构
+### 1.1 配置文件位置
 
-核心配置文件：
-- `react-router.config.ts` - React Router 全局配置
-- `app/routes.ts` - 路由自动生成配置
+| 配置文件 | 路径 | 作用 |
+|----------|------|------|
+| React Router 全局配置 | `react-router.config.ts` | 配置 SSR、路由发现模式等 |
+| 路由生成配置 | `app/routes.ts` | 配置 `react-router-auto-routes` 的忽略规则 |
 
----
+### 1.2 生成链路图
 
-## 路由自动生成机制
-
-### 1. 技术栈演进
-
-Epic Stack 经历了路由工具的演进：
-- **旧方案**：`remix-flat-routes` - 使用 `+` 后缀的混合约定
-- **新方案**：`react-router-auto-routes` - 更贴近 React Router 原生约定
-
-决策文档：`docs/decisions/045-rr-auto-routes.md`
-
-### 2. 配置结构
-
-**`react-router.config.ts`（全局配置）：**
-
-```typescript
-export default {
-  ssr: true,
-  routeDiscovery: { mode: 'initial' },  // 路由发现模式
-  // ...
-}
+```
+react-router.config.ts
+        │
+        ▼
+routeDiscovery: { mode: 'initial' }
+        │
+        ▼
+    读取 app/routes/ 目录
+        │
+        ▼
+    app/routes.ts 配置
+        │
+        ▼
+    autoRoutes({ ignoredRouteFiles: [...] })
+        │
+        ▼
+    扫描文件 → 应用忽略规则 → 解析命名约定
+        │
+        ▼
+    生成路由清单（Routes）
 ```
 
-**`app/routes.ts`（路由生成配置）：**
+### 1.3 真实配置内容
+
+**`react-router.config.ts`（第 1-25 行）：**
 
 ```typescript
+import { type Config } from '@react-router/dev/config'
+import { sentryOnBuildEnd } from '@sentry/react-router'
+
+const MODE = process.env.NODE_ENV
+
+export default {
+  ssr: true,
+  routeDiscovery: { mode: 'initial' },
+  future: {
+    unstable_optimizeDeps: true,
+  },
+  buildEnd: async ({ viteConfig, reactRouterConfig, buildManifest }) => {
+    if (MODE === 'production' && process.env.SENTRY_AUTH_TOKEN) {
+      await sentryOnBuildEnd({
+        viteConfig,
+        reactRouterConfig,
+        buildManifest,
+      })
+    }
+  },
+} satisfies Config
+```
+
+**`app/routes.ts`（第 1-18 行）：**
+
+```typescript
+import { type RouteConfig } from '@react-router/dev/routes'
 import { autoRoutes } from 'react-router-auto-routes'
 
 export default autoRoutes({
@@ -57,506 +77,327 @@ export default autoRoutes({
     '**/*.css',
     '**/*.test.{js,jsx,ts,tsx}',
     '**/__*.*',
+    // This is for server-side utilities you want to colocate
+    // next to your routes without making an additional
+    // directory. If you need a route that includes "server" or
+    // "client" in the filename, use the escape brackets like:
+    // my-route.[server].tsx
     '**/*.server.*',
     '**/*.client.*',
   ],
-})
+}) satisfies RouteConfig
 ```
 
-### 3. 路由发现流程
+### 1.4 忽略规则明细
 
-1. 扫描 `app/routes/` 目录
-2. 根据文件命名约定解析路径
-3. 应用忽略规则过滤非路由文件
-4. 生成路由树配置
-5. 与 `root.tsx` 组合形成完整路由
+| 模式 | 匹配示例 | 说明 |
+|------|----------|------|
+| `.*` | `.gitkeep`, `.env` | 隐藏文件 |
+| `**/*.css` | `styles.css`, `tailwind.css` | 样式文件 |
+| `**/*.test.{js,jsx,ts,tsx}` | `callback.test.ts`, `index.test.tsx` | 测试文件 |
+| `**/__*.*` | `__utils.ts`, `__helpers.js` | 双下划线前缀文件 |
+| `**/*.server.*` | `verify.server.ts`, `login.server.ts` | 服务端专用模块 |
+| `**/*.client.*` | `utils.client.ts` | 客户端专用模块 |
 
-**调试工具：**
-```bash
-npx react-router routes
+### 1.5 生成后的路由清单（基于 docs/routing.md）
+
+```tsx
+<Routes>
+  <Route file="root.tsx">
+    <Route path="*" file="routes/$.tsx" />
+    <Route path="auth/:provider/callback" file="routes/_auth/auth.$provider/callback.ts" />
+    <Route path="auth/:provider" index file="routes/_auth/auth.$provider/index.ts" />
+    <Route path="forgot-password" file="routes/_auth/forgot-password.tsx" />
+    <Route path="login" file="routes/_auth/login.tsx" />
+    <Route path="logout" file="routes/_auth/logout.tsx" />
+    <Route path="onboarding/:provider" file="routes/_auth/onboarding/$provider.tsx" />
+    <Route path="onboarding" index file="routes/_auth/onboarding/index.tsx" />
+    <Route path="reset-password" file="routes/_auth/reset-password.tsx" />
+    <Route path="signup" file="routes/_auth/signup.tsx" />
+    <Route path="verify" file="routes/_auth/verify.tsx" />
+    <Route path="webauthn/authentication" file="routes/_auth/webauthn/authentication.ts" />
+    <Route path="webauthn/registration" file="routes/_auth/webauthn/registration.ts" />
+    <Route path="about" file="routes/_marketing/about.tsx" />
+    <Route index file="routes/_marketing/index.tsx" />
+    <Route path="privacy" file="routes/_marketing/privacy.tsx" />
+    <Route path="support" file="routes/_marketing/support.tsx" />
+    <Route path="tos" file="routes/_marketing/tos.tsx" />
+    <Route path="robots.txt" file="routes/_seo/robots[.]txt.ts" />
+    <Route path="sitemap.xml" file="routes/_seo/sitemap[.]xml.ts" />
+    <Route path="admin/cache" index file="routes/admin/cache/index.tsx" />
+    <Route path="admin/cache/lru/:cacheKey" file="routes/admin/cache/lru.$cacheKey.ts" />
+    <Route path="admin/cache/sqlite" file="routes/admin/cache/sqlite.tsx">
+      <Route path=":cacheKey" file="routes/admin/cache/sqlite.$cacheKey.ts" />
+    </Route>
+    <Route path="me" file="routes/me.tsx" />
+    <Route path="resources/download-user-data" file="routes/resources/download-user-data.tsx" />
+    <Route path="resources/healthcheck" file="routes/resources/healthcheck.tsx" />
+    <Route path="resources/images" file="routes/resources/images.tsx" />
+    <Route path="resources/theme-switch" file="routes/resources/theme-switch.tsx" />
+    <Route path="settings/profile" file="routes/settings/profile/_layout.tsx">
+      <Route path="change-email" file="routes/settings/profile/change-email.tsx" />
+      <Route path="connections" file="routes/settings/profile/connections.tsx" />
+      <Route index file="routes/settings/profile/index.tsx" />
+      <Route path="passkeys" file="routes/settings/profile/passkeys.tsx" />
+      <Route path="password" file="routes/settings/profile/password.tsx" />
+      <Route path="password/create" file="routes/settings/profile/password_.create.tsx" />
+      <Route path="photo" file="routes/settings/profile/photo.tsx" />
+      <Route path="two-factor" file="routes/settings/profile/two-factor/_layout.tsx">
+        <Route path="disable" file="routes/settings/profile/two-factor/disable.tsx" />
+        <Route index file="routes/settings/profile/two-factor/index.tsx" />
+        <Route path="verify" file="routes/settings/profile/two-factor/verify.tsx" />
+      </Route>
+    </Route>
+    <Route path="users/:username" index file="routes/users/$username/index.tsx" />
+    <Route path="users/:username/notes" file="routes/users/$username/notes/_layout.tsx">
+      <Route path=":noteId" file="routes/users/$username/notes/$noteId.tsx" />
+      <Route path=":noteId/edit" file="routes/users/$username/notes/$noteId_.edit.tsx" />
+      <Route index file="routes/users/$username/notes/index.tsx" />
+      <Route path="new" file="routes/users/$username/notes/new.tsx" />
+    </Route>
+    <Route path="users" index file="routes/users/index.tsx" />
+  </Route>
+</Routes>
 ```
-此命令可输出 JSX 风格的路由树，便于验证路由映射。
 
 ---
 
-## 文件命名与路径映射约定
+## 二、对照表：会参与路由发现 vs 被忽略但可共置
 
-### 1. 基础路由
+### 2.1 会参与路由发现的约定
 
-| 文件名 | URL 路径 | 说明 |
-|--------|----------|------|
-| `about.tsx` | `/about` | 普通路由 |
-| `index.tsx` | `/` | 索引路由（目录级） |
-| `me.tsx` | `/me` | 根级路由 |
+| 约定符号 | 规则说明 | 真实文件示例 | 生成的 URL 路径 |
+|----------|----------|--------------|-----------------|
+| `$` 前缀（动态参数） | 文件名或目录名以 `$` 开头，映射为 URL 动态段 | `$username/`, `$noteId.tsx`, `$cacheKey.ts` | `/users/:username`, `/:noteId`, `/:cacheKey` |
+| `_` 前缀（路径组目录） | 目录名以 `_` 开头，不影响 URL，仅用于组织 | `_auth/`, `_marketing/`, `_seo/` | 不影响（其子路由路径不含 `_auth` 等前缀） |
+| `_layout.tsx`（布局文件） | 目录内的 `_layout.tsx` 作为该级别的布局组件 | `settings/profile/_layout.tsx`, `users/$username/notes/_layout.tsx` | 作为父路由，路径为目录路径 |
+| `index.tsx`（索引路由） | 目录内的 `index.tsx` 作为该目录的索引路由 | `users/index.tsx`, `_marketing/index.tsx` | 对应目录路径（如 `/users`, `/`） |
+| `$`（通配符） | 根级 `$.tsx` 作为兜底路由 | `$.tsx` | `/*` |
+| `[.]`（转义点号） | `[.]` 转义为真实点号 | `robots[.]txt.ts`, `sitemap[.]xml.ts` | `/robots.txt`, `/sitemap.xml` |
+| `_` 后缀（路径后缀） | 文件名末尾 `_` 后接内容，映射为额外路径段 | `password_.create.tsx`, `$noteId_.edit.tsx` | `/password/create`, `/:noteId/edit` |
+| 普通文件 | 不含特殊符号的 `.ts`/`.tsx` 文件 | `login.tsx`, `logout.tsx`, `about.tsx` | `/login`, `/logout`, `/about` |
+| 普通目录 | 不含特殊前缀的目录 | `admin/`, `resources/`, `settings/` | 嵌套路由层次（如 `/admin/cache`） |
 
-**目录结构示例：**
+### 2.2 被忽略但可共置的约定
+
+| 约定符号 | 规则说明 | 真实文件示例 | 用途说明 |
+|----------|----------|--------------|----------|
+| `+` 前缀目录 | 目录名以 `+` 开头，不会被识别为路由 | `+logos/`, `+shared/` | 存放与路由相关的共享代码、资源 |
+| `.server.` | 文件名包含 `.server.` | `verify.server.ts`, `login.server.ts`, `index.server.ts`, `note-editor.server.tsx` | 服务端专用逻辑，仅在服务端执行，不会泄露到客户端 |
+| `.client.` | 文件名包含 `.client.` | （当前仓库无实例，配置支持） | 客户端专用逻辑，仅在浏览器执行 |
+| `.test.` | 文件名包含 `.test.` | `callback.test.ts`, `index.test.tsx` | 测试文件，与路由共置但不参与路由 |
+| `.css` | 扩展名为 `.css` | （当前仓库 routes 目录无，配置支持） | 样式文件，通过其他方式引入 |
+| `.*` | 隐藏文件（以 `.` 开头） | （当前仓库 routes 目录无） | Git 忽略文件、环境文件等 |
+| `__*` | 双下划线前缀 | （当前仓库 routes 目录无） | 内部工具文件 |
+
+---
+
+## 三、真实目录结构与路由映射对照
+
+### 3.1 完整目录结构
+
 ```
 app/routes/
-├── about.tsx          → /about
-├── me.tsx             → /me
+├── $.tsx                                    → /*
+├── me.tsx                                   → /me
+├── _auth/                                   ← 路径组（不影响 URL）
+│   ├── auth.$provider/
+│   │   ├── callback.test.ts                 ← 测试文件（忽略）
+│   │   ├── callback.ts                      → /auth/:provider/callback
+│   │   └── index.ts                         → /auth/:provider（索引）
+│   ├── onboarding/
+│   │   ├── $provider.server.ts              ← 服务端模块（忽略）
+│   │   ├── $provider.tsx                    → /onboarding/:provider
+│   │   ├── index.server.ts                  ← 服务端模块（忽略）
+│   │   └── index.tsx                        → /onboarding（索引）
+│   ├── webauthn/
+│   │   ├── authentication.ts                → /webauthn/authentication
+│   │   ├── registration.ts                  → /webauthn/registration
+│   │   └── utils.server.ts                  ← 服务端模块（忽略）
+│   ├── forgot-password.tsx                  → /forgot-password
+│   ├── login.server.ts                      ← 服务端模块（忽略）
+│   ├── login.tsx                            → /login
+│   ├── logout.tsx                           → /logout
+│   ├── reset-password.server.ts             ← 服务端模块（忽略）
+│   ├── reset-password.tsx                   → /reset-password
+│   ├── signup.tsx                           → /signup
+│   ├── verify.server.ts                     ← 服务端模块（忽略）
+│   └── verify.tsx                           → /verify
+├── _marketing/                              ← 路径组（不影响 URL）
+│   ├── +logos/                              ← 共置目录（忽略）
+│   │   ├── logos.ts
+│   │   ├── docker.svg
+│   │   ├── remix.svg
+│   │   └── ...
+│   ├── about.tsx                            → /about
+│   ├── index.tsx                            → /（索引）
+│   ├── privacy.tsx                          → /privacy
+│   ├── support.tsx                          → /support
+│   └── tos.tsx                              → /tos
+├── _seo/                                    ← 路径组（不影响 URL）
+│   ├── robots[.]txt.ts                      → /robots.txt
+│   └── sitemap[.]xml.ts                     → /sitemap.xml
+├── admin/
+│   └── cache/
+│       ├── index.tsx                        → /admin/cache（索引）
+│       ├── lru.$cacheKey.ts                 → /admin/cache/lru/:cacheKey
+│       ├── sqlite.$cacheKey.ts              → /admin/cache/sqlite/:cacheKey
+│       ├── sqlite.server.ts                 ← 服务端模块（忽略）
+│       └── sqlite.tsx                       → /admin/cache/sqlite
+├── resources/
+│   ├── download-user-data.tsx               → /resources/download-user-data
+│   ├── healthcheck.tsx                      → /resources/healthcheck
+│   ├── images.tsx                           → /resources/images
+│   └── theme-switch.tsx                     → /resources/theme-switch
+├── settings/
+│   └── profile/
+│       ├── two-factor/
+│       │   ├── _layout.tsx                  → /settings/profile/two-factor（布局）
+│       │   ├── disable.tsx                  → /settings/profile/two-factor/disable
+│       │   ├── index.tsx                    → /settings/profile/two-factor（索引）
+│       │   └── verify.tsx                   → /settings/profile/two-factor/verify
+│       ├── _layout.tsx                      → /settings/profile（布局）
+│       ├── change-email.server.tsx          ← 服务端模块（忽略）
+│       ├── change-email.tsx                 → /settings/profile/change-email
+│       ├── connections.tsx                  → /settings/profile/connections
+│       ├── index.tsx                        → /settings/profile（索引）
+│       ├── passkeys.tsx                     → /settings/profile/passkeys
+│       ├── password.tsx                     → /settings/profile/password
+│       ├── password_.create.tsx             → /settings/profile/password/create
+│       └── photo.tsx                        → /settings/profile/photo
 └── users/
-    └── index.tsx      → /users
-```
-
-### 2. 动态路由（`$` 前缀）
-
-使用 `$` 前缀命名文件或目录表示动态参数。
-
-| 命名方式 | URL 路径 | 参数名 |
-|----------|----------|--------|
-| `$username.tsx` | `/users/:username` | `params.username` |
-| `$noteId.tsx` | `/notes/:noteId` | `params.noteId` |
-
-**示例：**
-```
-app/routes/users/
-└── $username/
-    ├── index.tsx      → /users/:username
-    └── notes/
-        └── $noteId.tsx → /users/:username/notes/:noteId
-```
-
-代码中访问参数：
-```typescript
-export async function loader({ params }: Route.LoaderArgs) {
-  const username = params.username  // 类型安全
-  const noteId = params.noteId
-}
-```
-
-### 3. 路径组（`_` 前缀）
-
-使用 `_` 前缀的目录表示**路径组**，该前缀**不会出现在 URL 中**，仅用于组织路由和共享布局。
-
-| 目录名 | 用途 | URL 影响 |
-|--------|------|----------|
-| `_auth/` | 认证相关路由 | 不影响 URL |
-| `_marketing/` | 营销页面路由 | 不影响 URL |
-| `_seo/` | SEO 资源路由 | 不影响 URL |
-
-**示例：**
-```
-app/routes/_auth/
-├── login.tsx          → /login （而非 /_auth/login）
-├── signup.tsx         → /signup
-└── forgot-password.tsx → /forgot-password
-```
-
-### 4. 嵌套路由与布局
-
-#### 4.1 目录结构嵌套
-
-子目录自动创建嵌套路由层次：
-
-```
-app/routes/settings/
-└── profile/
-    ├── _layout.tsx    → /settings/profile（布局组件）
-    ├── index.tsx      → /settings/profile（索引）
-    ├── password.tsx   → /settings/profile/password
-    └── two-factor/
-        ├── _layout.tsx → /settings/profile/two-factor（子布局）
-        └── index.tsx  → /settings/profile/two-factor
-```
-
-#### 4.2 `_layout.tsx` 布局文件
-
-`_layout.tsx` 是当前目录级别的布局组件，通过 `<Outlet />` 渲染子路由：
-
-```typescript
-// app/routes/users/$username/notes/_layout.tsx
-import { Outlet } from 'react-router'
-
-export default function NotesLayout({ loaderData }) {
-  return (
-    <div className="layout">
-      <nav>{/* 侧边栏导航 */}</nav>
-      <main>
-        <Outlet />  {/* 子路由内容渲染位置 */}
-      </main>
-    </div>
-  )
-}
-```
-
-#### 4.3 无布局嵌套（普通目录）
-
-如果目录中没有 `_layout.tsx`，子路由仍会嵌套但没有中间布局层：
-
-```
-app/routes/admin/
-└── cache/
-    ├── index.tsx           → /admin/cache（索引）
-    └── lru.$cacheKey.tsx   → /admin/cache/lru/:cacheKey
-```
-
-### 5. 转义字符（`[.]`）
-
-使用 `[.]` 转义文件名中的点号，用于创建包含扩展名的路由：
-
-| 文件名 | URL 路径 |
-|--------|----------|
-| `robots[.]txt.ts` | `/robots.txt` |
-| `sitemap[.]xml.ts` | `/sitemap.xml` |
-
-**示例：**
-```typescript
-// app/routes/_seo/robots[.]txt.ts
-export async function loader() {
-  return new Response('User-agent: *\nAllow: /', {
-    headers: { 'Content-Type': 'text/plain' },
-  })
-}
-```
-
-### 6. 路径后缀（`_` 后缀）
-
-使用 `_` 后缀可以创建 URL 中的额外路径段：
-
-| 文件名 | URL 路径 |
-|--------|----------|
-| `password_.create.tsx` | `/password/create` |
-| `$noteId_.edit.tsx` | `/:noteId/edit` |
-
-**示例对比：**
-```
-app/routes/settings/profile/
-├── password.tsx         → /settings/profile/password
-└── password_.create.tsx → /settings/profile/password/create
-```
-
-### 7. 通配符路由（`$`）
-
-根级的 `$.tsx` 作为通配符/404 路由：
-
-```
-app/routes/
-└── $.tsx                → /*（兜底路由）
+    ├── $username/                           ← 动态参数
+    │   ├── notes/
+    │   │   ├── +shared/                     ← 共置目录（忽略）
+    │   │   │   ├── note-editor.server.tsx   ← 服务端模块（忽略）
+    │   │   │   └── note-editor.tsx
+    │   │   ├── $noteId.tsx                  → /users/:username/notes/:noteId
+    │   │   ├── $noteId_.edit.tsx            → /users/:username/notes/:noteId/edit
+    │   │   ├── _layout.tsx                  → /users/:username/notes（布局）
+    │   │   ├── index.tsx                    → /users/:username/notes（索引）
+    │   │   └── new.tsx                      → /users/:username/notes/new
+    │   ├── index.test.tsx                   ← 测试文件（忽略）
+    │   └── index.tsx                        → /users/:username（索引）
+    └── index.tsx                            → /users（索引）
 ```
 
 ---
 
-## 路由模块共置约定
+## 四、共置模式详解
 
-Epic Stack 的核心设计理念之一是 **"路由与相关代码共置"**。以下是共置约定的详细说明：
+### 4.1 `+` 前缀目录共置
 
-### 1. `+` 前缀目录（共置资源目录）
+**示例 1：`+logos/` - 资源集合**
 
-以 `+` 开头的目录**不会被识别为路由**，用于存放与当前路由相关的共享代码、资源和类型。
-
-| 目录名 | 用途 | 示例内容 |
-|--------|------|----------|
-| `+shared/` | 共享组件和逻辑 | 表单组件、工具函数 |
-| `+logos/` | 静态资源集合 | SVG 图标、图片 |
-| `+types/` | 类型定义 | React Router 自动生成的类型 |
-
-#### 1.1 `+shared/` - 共享组件
-
-存放多个路由共享的组件：
+位置：`app/routes/_marketing/+logos/`
 
 ```
-app/routes/users/$username/notes/
-├── +shared/
-│   ├── note-editor.tsx          # 笔记编辑器组件
-│   └── note-editor.server.tsx   # 服务端 action 逻辑
-├── $noteId.tsx                  # 查看笔记（使用 +shared 组件）
-├── $noteId_.edit.tsx            # 编辑笔记（使用 +shared 组件）
-└── new.tsx                      # 新建笔记（使用 +shared 组件）
++logos/
+├── logos.ts        # 图标数据配置模块
+├── docker.svg
+├── eslint.svg
+├── remix.svg
+├── tailwind.svg
+└── ...
 ```
 
-**使用方式：**
+使用方式（`_marketing/index.tsx`）：
 ```typescript
-// app/routes/users/$username/notes/new.tsx
-import { NoteEditor } from './+shared/note-editor.tsx'
-import { action } from './+shared/note-editor.server.tsx'
-
-export { action }
-export default function NewNoteRoute() {
-  return <NoteEditor />
-}
-```
-
-#### 1.2 `+logos/` - 资源集合
-
-存放与页面相关的静态资源：
-
-```
-app/routes/_marketing/
-├── +logos/
-│   ├── logos.ts        # 图标数据配置
-│   ├── remix.svg
-│   ├── tailwind.svg
-│   └── stars.jpg
-└── index.tsx           # 首页引用 +logos/logos.ts
-```
-
-**使用方式：**
-```typescript
-// app/routes/_marketing/index.tsx
 import { logos, stars } from './+logos/logos.ts'
 ```
 
-#### 1.3 `+types/` - 类型定义目录
+**示例 2：`+shared/` - 共享组件**
 
-React Router 自动生成的类型目录，提供类型安全的路由参数和加载器数据：
+位置：`app/routes/users/$username/notes/+shared/`
 
+```
++shared/
+├── note-editor.tsx          # 笔记编辑器组件
+└── note-editor.server.tsx   # 服务端 action 逻辑
+```
+
+被多个路由复用：
+- `$noteId_.edit.tsx` - 编辑笔记
+- `new.tsx` - 新建笔记
+
+### 4.2 `.server.` 模块共置
+
+**模式 A：独立服务端文件**
+
+```
+verify.tsx              # 路由组件（客户端+服务端）
+verify.server.ts        # 服务端逻辑（被忽略，可被路由文件 import）
+```
+
+**`verify.server.ts` 真实内容（第 1-200 行）：**
 ```typescript
-// 自动生成类型，可在路由文件中引用
-import { type Route } from './+types/$noteId_.edit.ts'
-
-export async function loader({ params }: Route.LoaderArgs) {
-  // params.noteId 具有正确的类型
+export async function validateRequest(request: Request, body: URLSearchParams | FormData) {
+  // 纯服务端逻辑：数据库操作、验证等
 }
 
-export default function Component({ loaderData }: Route.ComponentProps) {
-  // loaderData 具有正确的类型
-}
+export async function prepareVerification({ ... }) { ... }
+export async function isCodeValid({ ... }) { ... }
 ```
 
-**生成命令：**
-```bash
-npm run typecheck
-# 或
-npx react-router typegen
-```
-
-### 2. `.server.` 后缀（服务端专用模块）
-
-文件名包含 `.server.` 的文件：
-- **不会被识别为路由**
-- 仅在服务端执行
-- 用于存放服务端逻辑、数据库操作等
-
-| 文件模式 | 用途 | 示例 |
-|----------|------|------|
-| `*.server.ts` | 纯服务端工具 | `verify.server.ts` |
-| `*.server.tsx` | 服务端组件/逻辑 | `note-editor.server.tsx` |
-
-**示例结构：**
-```
-app/routes/_auth/
-├── verify.tsx              # 路由文件（客户端+服务端）
-├── verify.server.ts        # 服务端验证逻辑（非路由）
-└── webauthn/
-    ├── authentication.ts   # 路由文件
-    ├── registration.ts     # 路由文件
-    └── utils.server.ts     # WebAuthn 服务端工具
-```
-
-**使用方式：**
-```typescript
-// app/routes/_auth/verify.tsx
-import { validateRequest } from './verify.server.ts'  // 仅服务端可见
-
-export async function action({ request }) {
-  const formData = await request.formData()
-  return validateRequest(request, formData)  // 调用服务端逻辑
-}
-```
-
-### 3. `.client.` 后缀（客户端专用模块）
-
-文件名包含 `.client.` 的文件：
-- **不会被识别为路由**
-- 仅在客户端执行
-- 用于存放浏览器专用逻辑
-
-虽然当前项目中未大量使用，但框架支持此约定。
-
-### 4. 路由与服务端逻辑配对模式
-
-对于复杂路由，常采用以下模式：
+**模式 B：路由与服务端逻辑配对**
 
 ```
-app/routes/_auth/onboarding/
-├── index.tsx           # 路由组件 + loader
-├── index.server.ts     # 服务端 action 逻辑（非路由）
+onboarding/
+├── index.tsx           # 路由组件
+├── index.server.ts     # 服务端 action
 ├── $provider.tsx       # 动态路由组件
-└── $provider.server.ts # 动态路由服务端逻辑（非路由）
+└── $provider.server.ts # 动态路由服务端 action
 ```
 
-这种模式的优势：
-- 服务端敏感代码不会泄露到客户端
-- 逻辑分离清晰
-- 便于测试
+### 4.3 `.test.` 文件共置
+
+```
+auth.$provider/
+├── callback.ts         # 路由文件
+└── callback.test.ts    # 测试文件（被忽略）
+
+users/$username/
+├── index.tsx           # 路由文件
+└── index.test.tsx      # 测试文件（被忽略）
+```
+
+### 4.4 `[server]` 转义（配置说明）
+
+根据 `app/routes.ts` 注释（第 10-14 行）：
+
+> If you need a route that includes "server" or "client" in the filename, use the escape brackets like: my-route.[server].tsx
+
+| 需要的路由路径 | 使用方式 | 说明 |
+|----------------|----------|------|
+| `/my-route/server` | `my-route.[server].tsx` | 方括号内的内容会被当作普通路径段 |
+| `/my-route/client` | `my-route.[client].tsx` | 避免被 `*.server.*` / `*.client.*` 规则忽略 |
+
+**当前仓库未使用此转义，所有 `.server.` 文件均为服务端专用模块。**
 
 ---
 
-## 特殊文件约定
+## 五、核心约定速查
 
-### 1. 测试文件
+### 5.1 路由发现符号
 
-```
-**/*.test.{js,jsx,ts,tsx}
-```
+| 符号 | 位置 | 作用 |
+|------|------|------|
+| `$` | 文件名/目录名前缀 | 动态 URL 参数 |
+| `_` | 目录名前缀 | 路径组（不影响 URL） |
+| `_` | 文件名后缀 | 额外路径段 |
+| `_layout.tsx` | 文件名 | 布局组件 |
+| `index.tsx` | 文件名 | 索引路由 |
+| `[.]` | 文件名内 | 转义点号 |
+| `$` | 根级文件名 | 通配符路由 |
 
-测试文件与路由文件共置，但不会被识别为路由：
+### 5.2 忽略规则符号
 
-```
-app/routes/_auth/auth.$provider/
-├── callback.ts
-├── callback.test.ts     # 测试文件（忽略）
-└── index.ts
-```
-
-### 2. 隐藏文件
-
-```
-.*
-```
-
-以 `.` 开头的文件被忽略。
-
-### 3. 双下划线文件
-
-```
-**/__*.*
-```
-
-以 `__` 开头的文件被忽略，常用于内部工具。
-
-### 4. CSS 文件
-
-```
-**/*.css
-```
-
-CSS 文件被忽略，样式应通过其他方式引入。
-
----
-
-## 配置与忽略规则
-
-### 1. 完整忽略规则（来自 `app/routes.ts`）
-
-```typescript
-ignoredRouteFiles: [
-  '.*',                    // 隐藏文件
-  '**/*.css',              // 样式文件
-  '**/*.test.{js,jsx,ts,tsx}',  // 测试文件
-  '**/__*.*',              // 双下划线文件
-  '**/*.server.*',         // 服务端专用模块
-  '**/*.client.*',         // 客户端专用模块
-]
-```
-
-### 2. 转义 `server`/`client` 关键词
-
-如果需要创建文件名包含 `server` 或 `client` 的路由，使用方括号转义：
-
-```
-my-route.[server].tsx    → /my-route/server
-my-route.[client].tsx    → /my-route/client
-```
-
----
-
-## 实际项目示例分析
-
-### 示例 1：完整的 Notes 路由结构
-
-```
-app/routes/users/$username/notes/
-├── _layout.tsx              # 布局 → /users/:username/notes
-├── index.tsx                # 列表 → /users/:username/notes
-├── $noteId.tsx              # 详情 → /users/:username/notes/:noteId
-├── $noteId_.edit.tsx        # 编辑 → /users/:username/notes/:noteId/edit
-├── new.tsx                  # 新建 → /users/:username/notes/new
-├── +shared/
-│   ├── note-editor.tsx      # 共享编辑器组件
-│   └── note-editor.server.tsx # 共享服务端逻辑
-└── +types/                  # 自动生成的类型
-    ├── _layout.ts
-    ├── index.ts
-    ├── $noteId.ts
-    └── $noteId_.edit.ts
-```
-
-**生成的路由树：**
-```tsx
-<Route path="users/:username/notes" file=".../_layout.tsx">
-  <Route index file=".../index.tsx" />
-  <Route path=":noteId" file=".../$noteId.tsx" />
-  <Route path=":noteId/edit" file=".../$noteId_.edit.tsx" />
-  <Route path="new" file=".../new.tsx" />
-</Route>
-```
-
-### 示例 2：认证路由组
-
-```
-app/routes/_auth/
-├── login.tsx               # /login
-├── logout.tsx              # /logout
-├── signup.tsx              # /signup
-├── verify.tsx              # /verify
-├── verify.server.ts        # 服务端验证逻辑
-├── auth.$provider/
-│   ├── callback.ts         # /auth/:provider/callback
-│   ├── callback.test.ts    # 测试（忽略）
-│   └── index.ts            # /auth/:provider
-├── onboarding/
-│   ├── index.tsx           # /onboarding
-│   ├── index.server.ts     # 服务端逻辑
-│   ├── $provider.tsx       # /onboarding/:provider
-│   └── $provider.server.ts # 服务端逻辑
-└── webauthn/
-    ├── authentication.ts   # /webauthn/authentication
-    ├── registration.ts     # /webauthn/registration
-    └── utils.server.ts     # WebAuthn 工具
-```
-
-### 示例 3：设置页面嵌套布局
-
-```
-app/routes/settings/profile/
-├── _layout.tsx             # 主布局 → /settings/profile
-├── index.tsx               # /settings/profile
-├── password.tsx            # /settings/profile/password
-├── password_.create.tsx    # /settings/profile/password/create
-├── two-factor/
-│   ├── _layout.tsx         # 子布局 → /settings/profile/two-factor
-│   ├── index.tsx           # /settings/profile/two-factor
-│   ├── enable.tsx          # /settings/profile/two-factor/enable
-│   └── verify.tsx          # /settings/profile/two-factor/verify
-└── +types/                 # 自动生成类型
-```
-
----
-
-## 总结
-
-### 核心约定速查表
-
-| 约定 | 符号 | 说明 | 示例 |
-|------|------|------|------|
-| 动态参数 | `$` | URL 动态段 | `$username`, `$noteId` |
-| 路径组 | `_` 前缀 | 组织路由，不影响 URL | `_auth`, `_marketing` |
-| 布局文件 | `_layout.tsx` | 目录级布局组件 | `settings/profile/_layout.tsx` |
-| 共置目录 | `+` 前缀 | 非路由资源目录 | `+shared`, `+types`, `+logos` |
-| 服务端模块 | `.server.` | 仅服务端，非路由 | `verify.server.ts` |
-| 客户端模块 | `.client.` | 仅客户端，非路由 | `utils.client.ts` |
-| 转义点号 | `[.]` | 文件名中的点 | `robots[.]txt.ts` |
-| 路径后缀 | `_` 后缀 | 额外 URL 段 | `password_.create.tsx` |
-| 通配符 | `$` | 根级兜底路由 | `$.tsx` |
-
-### 设计优势
-
-1. **类型安全**：自动生成 `+types/` 目录，提供完整的 TypeScript 类型支持
-2. **代码共置**：路由与相关逻辑、组件、测试放在一起
-3. **清晰组织**：路径组和布局系统支持大型应用的路由组织
-4. **服务端安全**：`.server.` 文件确保敏感代码不会泄露到客户端
-5. **与 React Router 兼容**：贴近原生约定，降低学习成本
-
-### 调试与验证
-
-```bash
-# 查看生成的路由树
-npx react-router routes
-
-# 生成类型定义
-npx react-router typegen
-
-# 完整类型检查
-npm run typecheck
-```
+| 符号/模式 | 作用 | 可共置？ |
+|-----------|------|----------|
+| `+` 目录前缀 | 共置资源目录 | ✅ 是 |
+| `*.server.*` | 服务端专用模块 | ✅ 是 |
+| `*.client.*` | 客户端专用模块 | ✅ 是 |
+| `*.test.*` | 测试文件 | ✅ 是 |
+| `*.css` | 样式文件 | ❌ 否 |
+| `.*` | 隐藏文件 | ❌ 否 |
+| `__*.*` | 双下划线文件 | ❌ 否 |
