@@ -1239,3 +1239,420 @@ MSW 拦截邮件请求后，将邮件内容写入 `tests/fixtures/email/${recipi
 ### Q5: 为什么 `prepareGitHubUser` 要设置 `MOCK_CODE_GITHUB_HEADER`？
 
 Playwright 测试和 MSW 是独立的进程，无法直接共享内存。通过在请求头中传递 `testId`，MSW 可以找到对应的 Mock 用户数据。
+
+---
+
+## 9. 并行执行时的 Fixtures 冲突风险分析
+
+### 9.1 validate 命令的并行机制
+
+```json
+// package.json
+{
+  "validate": "run-p \"test -- --run\" lint typecheck test:e2e:run"
+}
+```
+
+`validate` 命令使用 `npm-run-all` 的 `run-p`（parallel）并行执行 4 个任务：
+
+| 任务 | 命令 | 进程 | 资源访问 |
+|------|------|------|----------|
+| **test** | `vitest --run` | Vitest Worker 进程 (多个 pool) | `tests/fixtures/email/`, `tests/fixtures/github/users.${poolId}.local.json` |
+| **test:e2e:run** | `CI=true playwright test` | Playwright 进程 + 应用服务器进程 | `tests/fixtures/email/`, `tests/fixtures/github/users.0.local.json` |
+| **lint** | `eslint .` | 独立进程 | 只读访问代码 |
+| **typecheck** | `react-router typegen && tsc` | 独立进程 | 只读访问代码 |
+
+**关键发现**：Vitest 和 Playwright 的 E2E 测试**同时运行**，并且**共享同一个 fixtures 目录**。
+
+### 9.2 Fixtures 存储路径分析
+
+#### 9.2.1 Email Fixtures（无隔离）
+
+```typescript
+// tests/mocks/utils.ts
+const fixturesDirPath = path.join(__dirname, '..', 'fixtures')
+
+export async function writeEmail(rawEmail: unknown) {
+  const email = EmailSchema.parse(rawEmail)
+  await createFixture('email', email.to, email)  // 无任何隔离前缀
+  return email
+}
+
+export async function readEmail(recipient: string) {
+  try {
+    const email = await readFixture('email', recipient)
+    return EmailSchema.parse(email)
+  } catch (error) {
+    return null
+  }
+}
+
+// createFixture 写入: tests/fixtures/email/${name}.json
+```
+
+**存储路径**：
+- 写入：`tests/fixtures/email/${email.to}.json`
+- 读取：`tests/fixtures/email/${recipient}.json`
+
+**问题**：
+- **无任何隔离机制**
+- 所有进程（Vitest 的所有 pool + Playwright 应用服务器）写入同一目录
+- 文件名基于收件人邮箱，可能冲突
+
+#### 9.2.2 GitHub Users Fixtures（部分隔离）
+
+```typescript
+// tests/mocks/github.ts
+const githubUserFixturePath = path.join(
+  here(
+    '..',
+    'fixtures',
+    'github',
+    `users.${process.env.VITEST_POOL_ID || 0}.local.json`,
+  ),
+)
+```
+
+**存储路径**：
+- Vitest Pool 0: `tests/fixtures/github/users.0.local.json`
+- Vitest Pool 1: `tests/fixtures/github/users.1.local.json`
+- Playwright: `tests/fixtures/github/users.0.local.json`（因为 `process.env.VITEST_POOL_ID` 未设置，回退到 `0`）
+
+**问题**：
+- Vitest Pool 0 和 Playwright 的应用服务器**写入同一文件**
+- 文件是数组存储，并发写入可能导致数据丢失
+
+### 9.3 冲突场景分析
+
+#### 9.3.1 场景 1：Email Fixtures 冲突
+
+**时间线**：
+```
+T0: validate 启动
+    │
+    ├─ Vitest 启动 (test --run)
+    ├─ Playwright 启动 (test:e2e:run)
+    │
+T1: Vitest 测试 A (Pool 0)
+    │  └─ 发送邮件到 user1@example.com
+    │      └─ MSW (Vitest) 写入: tests/fixtures/email/user1@example.com.json
+    │
+T2: Playwright 测试 B (onboarding.test.ts)
+    │  └─ 注册用户 user1@example.com (faker 随机生成)
+    │      └─ MSW (应用服务器) 写入: tests/fixtures/email/user1@example.com.json
+    │         ⚠️ 覆盖了 Vitest 的文件！
+    │
+T3: Vitest 测试 A 尝试读取邮件
+    │  └─ readEmail('user1@example.com')
+    │      └─ 读取到的是 Playwright 写入的邮件（内容错误）
+    │         或 文件已被删除（测试 B 清理）
+    │
+    └─ ❌ 测试失败（间歇性失败）
+```
+
+**冲突类型**：
+1. **覆盖冲突**：两个进程写入同一个邮箱地址
+2. **读取错误数据**：读取到其他测试写入的邮件
+3. **文件不存在**：一个测试删除了另一个测试需要的文件
+
+**真实影响评估**：
+- **概率**：中等（依赖 faker 生成的邮箱是否碰撞）
+- **严重程度**：高（测试间歇性失败，难以调试）
+- **现有缓解**：无
+
+#### 9.3.2 场景 2：GitHub Users Fixtures 冲突
+
+**时间线**：
+```
+T0: validate 启动
+    │
+    ├─ Vitest 启动 (test --run, 多个 pool)
+    ├─ Playwright 启动 (test:e2e:run)
+    │
+T1: Vitest Pool 0 测试
+    │  └─ insertGitHubUser('code-123')
+    │      └─ 读取 users.0.local.json
+    │         [users = [...]]
+    │
+T2: Playwright 应用服务器
+    │  └─ insertGitHubUser('code-456')
+    │      └─ 读取 users.0.local.json（同一文件！）
+    │         [users = [...]]  ← 读取的是旧数据
+    │
+T3: Vitest Pool 0 完成更新
+    │  └─ 写入 users.0.local.json
+    │         [users = [..., code-123]]
+    │
+T4: Playwright 应用服务器完成更新
+    │  └─ 写入 users.0.local.json（基于 T2 的旧数据）
+    │         [users = [..., code-456]]
+    │         ⚠️ 覆盖了 Vitest 的 code-123！
+    │
+    └─ ❌ 数据丢失（间歇性）
+```
+
+**冲突类型**：
+1. **读写竞争**：读取-修改-写入非原子操作
+2. **数据丢失**：后写入的进程覆盖先写入的进程的数据
+3. **用户查找失败**：测试无法找到预期的 Mock 用户
+
+**真实影响评估**：
+- **概率**：低（只有 Pool 0 冲突，且需要并发写入）
+- **严重程度**：中（可能导致测试间歇性失败）
+- **现有缓解**：部分隔离（其他 pool 使用不同文件）
+
+#### 9.3.3 场景 3：测试间 Email 冲突（同一框架内）
+
+**Vitest 内的冲突**：
+```
+Vitest Pool 0: 测试 A 发送到 test@example.com
+Vitest Pool 1: 测试 B 发送到 test@example.com (faker 碰撞)
+    ↓
+写入同一文件: tests/fixtures/email/test@example.com.json
+    ↓
+相互覆盖
+```
+
+**Playwright 内的冲突**：
+```
+Playwright 测试 A: onboarding.test.ts → user1@example.com
+Playwright 测试 B: settings-profile.test.ts → user1@example.com (faker 碰撞)
+    ↓
+写入同一文件: tests/fixtures/email/user1@example.com.json
+    ↓
+相互覆盖
+```
+
+**真实影响评估**：
+- **概率**：低（faker 碰撞概率低）
+- **严重程度**：高（如果碰撞，测试失败）
+- **现有缓解**：faker 生成的随机数据降低碰撞概率
+
+### 9.4 现有隔离边界总结
+
+| Fixture 类型 | Vitest 内隔离 | Vitest vs Playwright 隔离 | 风险评估 |
+|-------------|---------------|---------------------------|----------|
+| **Email** | ❌ 无 | ❌ 无 | 🔴 高风险 |
+| **GitHub Users** | ✅ 部分（poolId 隔离） | ❌ 无（Pool 0 冲突） | 🟡 中风险 |
+| **Images (静态)** | ✅ 只读 | ✅ 只读 | 🟢 无风险 |
+
+### 9.5 可验证的规避策略
+
+#### 9.5.1 策略 1：在 fixtures 路径中添加进程标识符（推荐）
+
+修改 `tests/mocks/utils.ts`：
+
+```typescript
+// 为每个进程生成唯一标识符
+function getProcessId() {
+  // 优先使用 VITEST_POOL_ID（Vitest）
+  if (process.env.VITEST_POOL_ID) {
+    return `vitest-pool-${process.env.VITEST_POOL_ID}`
+  }
+  // Playwright 或其他进程使用 PID
+  return `proc-${process.pid}`
+}
+
+// 在子目录名中包含进程 ID
+export async function createFixture(
+  subdir: string,
+  name: string,
+  data: unknown,
+) {
+  const processId = getProcessId()
+  const dir = path.join(fixturesDirPath, subdir, processId)
+  await fsExtra.ensureDir(dir)
+  return fsExtra.writeJSON(path.join(dir, `./${name}.json`), data)
+}
+
+export async function readFixture(subdir: string, name: string) {
+  const processId = getProcessId()
+  return fsExtra.readJSON(path.join(fixturesDirPath, subdir, processId, `${name}.json`))
+}
+```
+
+**结果**：
+- Vitest Pool 0: `tests/fixtures/email/vitest-pool-0/${email}.json`
+- Vitest Pool 1: `tests/fixtures/email/vitest-pool-1/${email}.json`
+- Playwright: `tests/fixtures/email/proc-12345/${email}.json`
+
+**验证方法**：
+```bash
+# 1. 运行 validate 多次，确保无间歇性失败
+for i in {1..5}; do npm run validate || echo "FAILED at iteration $i"; done
+
+# 2. 检查 fixtures 目录结构
+ls -la tests/fixtures/email/
+# 应该看到多个子目录: vitest-pool-0/, vitest-pool-1/, proc-12345/
+```
+
+#### 9.5.2 策略 2：在文件名中添加时间戳或唯一 ID
+
+```typescript
+export async function writeEmail(rawEmail: unknown) {
+  const email = EmailSchema.parse(rawEmail)
+  // 在文件名中添加时间戳，避免覆盖
+  const timestamp = Date.now()
+  const uniqueName = `${email.to}-${timestamp}`
+  await createFixture('email', uniqueName, email)
+  return { ...email, uniqueId: uniqueName }
+}
+```
+
+**问题**：
+- 需要修改 `readEmail` 的调用方式（传入 uniqueId）
+- 改动较大，影响现有测试
+
+#### 9.5.3 策略 3：使用内存存储替代文件系统（仅测试环境）
+
+```typescript
+// 使用 Map 存储（进程内隔离）
+const inMemoryFixtures = new Map<string, Map<string, unknown>>()
+
+export async function createFixture(
+  subdir: string,
+  name: string,
+  data: unknown,
+) {
+  if (process.env.NODE_ENV === 'test') {
+    // 测试环境使用内存存储
+    let dirMap = inMemoryFixtures.get(subdir)
+    if (!dirMap) {
+      dirMap = new Map()
+      inMemoryFixtures.set(subdir, dirMap)
+    }
+    dirMap.set(name, data)
+    return
+  }
+  // 开发环境使用文件系统
+  const dir = path.join(fixturesDirPath, subdir)
+  await fsExtra.ensureDir(dir)
+  return fsExtra.writeJSON(path.join(dir, `./${name}.json`), data)
+}
+```
+
+**优点**：
+- 完全进程隔离（不同进程有不同的内存）
+- 无需清理（进程退出自动释放）
+
+**缺点**：
+- Playwright 测试和应用服务器是不同进程，无法共享内存
+- 邮件写入在应用服务器进程，读取在 Playwright 测试进程
+- **不适用**（需要跨进程共享）
+
+#### 9.5.4 策略 4：使用临时目录（系统级隔离）
+
+```typescript
+import os from 'os'
+
+// 每个进程使用独立的临时目录
+const tempFixturesDir = fsExtra.mkdtempSync(
+  path.join(os.tmpdir(), 'epic-stack-tests-'),
+)
+
+export async function createFixture(
+  subdir: string,
+  name: string,
+  data: unknown,
+) {
+  const dir = path.join(tempFixturesDir, subdir)
+  await fsExtra.ensureDir(dir)
+  return fsExtra.writeJSON(path.join(dir, `./${name}.json`), data)
+}
+
+// 测试结束后清理
+if (process.env.NODE_ENV === 'test') {
+  import('close-with-grace').then(({ default: closeWithGrace }) => {
+    closeWithGrace(async () => {
+      await fsExtra.remove(tempFixturesDir)
+    })
+  })
+}
+```
+
+**问题**：
+- 同策略 3：Playwright 测试和应用服务器是不同进程
+- 应用服务器写入临时目录 A，Playwright 测试读取临时目录 B
+- **不适用**
+
+#### 9.5.5 策略 5：串行执行测试（最保守）
+
+```json
+// package.json
+{
+  "validate": "run-s \"test -- --run\" lint typecheck test:e2e:run"
+}
+```
+
+将 `run-p`（parallel）改为 `run-s`（serial）
+
+**优点**：
+- 完全避免并行冲突
+- 无需修改代码
+
+**缺点**：
+- 验证速度变慢（可能增加 2-3 倍时间）
+- CI 成本增加
+
+### 9.6 推荐方案
+
+**短期方案（立即可用）**：
+1. 接受现有风险（实际碰撞概率较低）
+2. 或使用策略 5：临时改为串行执行验证
+
+**长期方案（推荐实施）**：
+1. 实现策略 1：在 fixtures 路径中添加进程标识符
+2. 注意：需要修改 `tests/mocks/github.ts` 的 `githubUserFixturePath` 使用相同的隔离逻辑
+
+```typescript
+// tests/mocks/github.ts
+function getProcessId() {
+  if (process.env.VITEST_POOL_ID) {
+    return `vitest-pool-${process.env.VITEST_POOL_ID}`
+  }
+  return `proc-${process.pid}`
+}
+
+const githubUserFixturePath = path.join(
+  here('..', 'fixtures', 'github', `${getProcessId()}.local.json`),
+)
+```
+
+### 9.7 验证测试
+
+创建一个专门的冲突测试来验证修复效果：
+
+```typescript
+// tests/e2e/fixtures-conflict.test.ts
+import { test, expect } from '@playwright/test'
+import { readEmail } from '#tests/mocks/utils.ts'
+import { prisma } from '#app/utils/db.server.ts'
+import { faker } from '@faker-js/faker'
+
+test('email fixtures are isolated between tests', async ({ page }) => {
+  // 生成唯一邮箱，避免与其他测试冲突
+  const uniqueEmail = `test-${Date.now()}-${Math.random()}@example.com`
+  
+  // 触发邮件发送
+  // ...
+  
+  // 读取并验证
+  const email = await readEmail(uniqueEmail)
+  expect(email).toBeDefined()
+  expect(email?.to).toBe(uniqueEmail.toLowerCase())
+})
+```
+
+---
+
+## 10. 最终架构风险矩阵
+
+| 组件 | 并行安全 | 隔离级别 | 风险等级 | 建议 |
+|------|----------|----------|----------|------|
+| **Vitest 数据库** | ✅ 安全 | 测试池 + 用例级 | 🟢 低 | 保持现状 |
+| **Playwright 数据库** | ⚠️ 部分安全 | 夹具清理 | 🟡 中 | 夹具清理需完善 |
+| **Vitest MSW** | ✅ 安全 | 进程级 | 🟢 低 | 保持现状 |
+| **Playwright MSW** | ⚠️ 部分安全 | 进程级（但共享 fixtures） | 🟡 中 | 保持现状 |
+| **Email Fixtures** | ❌ 不安全 | 无隔离 | 🔴 高 | 实施进程级隔离 |
+| **GitHub Fixtures** | ⚠️ 部分安全 | Pool 级（Pool 0 冲突） | 🟡 中 | 统一隔离策略 |
+| **静态图片 Fixtures** | ✅ 安全 | 只读 | 🟢 低 | 保持现状 |
