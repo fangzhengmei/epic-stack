@@ -2,14 +2,16 @@
 
 ## 1. 核心架构概览
 
-Epic Stack 的测试体系包含**两套独立的测试框架**，各自有独立的数据库隔离机制和 MSW 实例：
+Epic Stack 的测试体系包含**两套独立的测试框架**，各自有独立的进程、数据库和 MSW 实例，但它们通过**文件系统共享 fixtures 目录**：
 
 | 框架 | 用途 | 进程 | 数据库 | MSW 加载方式 |
 |------|------|------|--------|--------------|
-| **Vitest** | 单元测试、集成测试 | Vitest 进程 | 测试池隔离 (`data.${poolId}.db`) | 通过 `setupFiles` 导入 |
-| **Playwright** | E2E 测试 | Playwright + 应用服务器 (Node.js) | 默认数据库 (`.env` 配置) | 通过 `MOCKS=true` 环境变量 |
+| **Vitest** | 单元测试、集成测试 | Vitest Worker 进程 (每个 pool 一个) | 测试池隔离 (`tests/prisma/data.${poolId}.db`) | 通过 `setupFiles` 导入 |
+| **Playwright** | E2E 测试 | Playwright 测试进程 + 应用服务器进程 | 默认数据库 (`.env` 配置) | 通过 `MOCKS=true` 环境变量 |
 
-**关键理解**：Vitest 和 Playwright 是**完全独立**的两个系统，它们不共享进程、不共享数据库、不共享 MSW 实例。
+**关键理解**：
+- **进程级隔离**：Vitest 和 Playwright 是**完全独立**的进程，不共享内存、不共享数据库、不共享 MSW 实例
+- **文件系统共享**：两者通过 `tests/fixtures/` 目录共享文件资源（这是并行冲突的来源）
 
 ---
 
