@@ -54,8 +54,8 @@ export default {
 
 | 类别 | 数量 | 示例 |
 |------|------|------|
-| 路由文件（.ts/.tsx） | 50+ | `login.tsx`, `$.tsx`, `_layout.tsx` |
-| 被忽略文件 | 14 | 见下表 |
+| 路由文件（.ts/.tsx） | 47 | `login.tsx`, `$.tsx`, `_layout.tsx` |
+| 被忽略文件 | 37 | 见下表 |
 | `+` 前缀目录 | 2 | `+logos/`, `+shared/` |
 | 路径组目录（`_` 前缀） | 3 | `_auth/`, `_marketing/`, `_seo/` |
 
