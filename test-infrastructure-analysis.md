@@ -1141,7 +1141,7 @@ export default defineConfig({
 
 ## 7. 核心架构总结
 
-### 7.1 两套独立系统
+### 7.1 资源关系总览
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
@@ -1158,7 +1158,10 @@ export default defineConfig({
 │  │                                                         │   │
 │  │  适用: 单元测试、工具函数测试、loader/action 测试        │   │
 │  └─────────────────────────────────────────────────────────┘   │
-│                                                                 │
+│                          │                                      │
+│                          │ 文件系统共享                          │
+│                          │ (tests/fixtures/)                    │
+│                          ▼                                      │
 │  ┌─────────────────────────────────────────────────────────┐   │
 │  │                  Playwright 系统                         │   │
 │  │                                                         │   │
@@ -1172,19 +1175,53 @@ export default defineConfig({
 │  │  ├─ 加载 MSW (如果 MOCKS=true)                          │   │
 │  │  └─ 操作数据库 (使用 .env DATABASE_URL)                 │   │
 │  │                                                         │   │
-│  │  数据库: .env 中配置的默认数据库 (共享)                  │   │
+│  │  数据库: .env 中配置的默认数据库                         │   │
 │  │  MSW: 在应用服务器进程中加载                             │   │
 │  │  隔离: 依赖夹具 cleanup 手动删除数据                     │   │
 │  │                                                         │   │
 │  │  适用: E2E 测试、用户流程测试                            │   │
 │  └─────────────────────────────────────────────────────────┘   │
 │                                                                 │
-│  ⚠️ 重要: Vitest 和 Playwright 不共享任何资源！                  │
+│  ⚠️ 重要: 进程/数据库/MSW 完全隔离，但 fixtures 目录共享！        │
 │                                                                 │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-### 7.2 关键决策点
+### 7.2 资源共享矩阵
+
+| 资源类型 | Vitest | Playwright | 共享方式 | 隔离状态 |
+|----------|--------|------------|----------|----------|
+| **进程** | Vitest Worker | Playwright + 应用服务器 | 独立进程 | ✅ 完全隔离 |
+| **数据库** | `tests/prisma/data.${poolId}.db` | `.env` 配置的数据库 | 独立文件 | ✅ 完全隔离 |
+| **MSW 实例** | 独立 Server (A) | 独立 Server (B) | 独立实例 | ✅ 完全隔离 |
+| **内存数据** | 独立内存空间 | 独立内存空间 | 无共享 | ✅ 完全隔离 |
+| **Email Fixtures** | `tests/fixtures/email/` | `tests/fixtures/email/` | 文件系统 | ❌ 无隔离 |
+| **GitHub Fixtures** | `users.${poolId}.local.json` | `users.0.local.json` | 文件系统 | ⚠️ 部分隔离 |
+| **静态图片** | `tests/fixtures/images/` (只读) | `tests/fixtures/images/` (只读) | 文件系统 | ✅ 安全（只读） |
+
+### 7.3 统一架构口径
+
+**核心原则**：
+
+1. **进程级资源完全隔离**
+   - Vitest 和 Playwright 是独立的 Node.js 进程
+   - 各自有独立的数据库连接（不同的数据库文件）
+   - 各自有独立的 MSW Server 实例
+   - 无法通过内存直接通信
+
+2. **文件系统资源共享**
+   - 两者都读取/写入 `tests/fixtures/` 目录
+   - 这是**唯一**的共享资源
+   - 这也是并行冲突的**唯一**来源（详见第 9 章）
+
+3. **数据传递机制**
+   - **Vitest 内部**：函数调用、内存传递
+   - **Playwright 内部**：
+     - 测试进程 ↔ 应用服务器：通过 HTTP 请求
+     - 应用服务器 ↔ 测试进程：通过数据库 + fixtures 文件系统
+   - **Vitest ↔ Playwright**：无设计上的数据传递（各自是独立测试）
+
+### 7.4 关键决策点
 
 | 决策 | Vitest 方案 | Playwright 方案 |
 |------|-------------|-----------------|
@@ -1195,7 +1232,7 @@ export default defineConfig({
 | **测试速度** | 快 (无浏览器) | 慢 (有浏览器 + 服务器) |
 | **测试真实性** | 较低 (单元/集成) | 高 (真实浏览器) |
 
-### 7.3 最佳实践
+### 7.5 最佳实践
 
 1. **单元测试用 Vitest**：
    - 工具函数、纯函数
@@ -1212,9 +1249,15 @@ export default defineConfig({
    - Playwright：依赖夹具的 `cleanup` 阶段手动删除
 
 4. **MSW 使用**：
-   - 不要假设 Vitest 和 Playwright 共享 MSW 状态
+   - Vitest 和 Playwright 有**独立的 MSW 实例**，不共享状态
+   - Playwright 测试中，MSW 运行在**应用服务器进程**，不是测试进程
    - Playwright 测试中读取邮件使用 `readEmail()`
    - GitHub OAuth 测试使用 `prepareGitHubUser()` 夹具
+
+5. **Fixtures 使用**：
+   - 意识到 `tests/fixtures/` 是**共享目录**（Vitest 和 Playwright 都访问）
+   - 并行执行时可能发生冲突（详见第 9 章）
+   - 优先使用唯一标识符（如时间戳、随机字符串）命名 fixtures
 
 ---
 
@@ -1241,6 +1284,22 @@ MSW 拦截邮件请求后，将邮件内容写入 `tests/fixtures/email/${recipi
 ### Q5: 为什么 `prepareGitHubUser` 要设置 `MOCK_CODE_GITHUB_HEADER`？
 
 Playwright 测试和 MSW 是独立的进程，无法直接共享内存。通过在请求头中传递 `testId`，MSW 可以找到对应的 Mock 用户数据。
+
+### Q6: Vitest 和 Playwright 之间有共享资源吗？
+
+**有，但仅限于文件系统上的 fixtures 目录**。
+
+**完全隔离的资源**：
+- 进程内存
+- 数据库连接（不同的数据库文件）
+- MSW 实例（独立的 Server）
+
+**共享的资源**：
+- `tests/fixtures/` 目录（文件系统）
+  - `tests/fixtures/email/`：完全共享，无隔离
+  - `tests/fixtures/github/users.${poolId}.local.json`：Vitest Pool 0 和 Playwright 共享 `users.0.local.json`
+
+这也是并行执行时冲突风险的**唯一来源**（详见第 9 章）。
 
 ---
 
